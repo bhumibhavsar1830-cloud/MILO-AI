@@ -2,7 +2,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { parseCommand } from "../utils/commandParser";
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+import API_BASE_URL from "../config";
+
+const BACKEND_URL = API_BASE_URL;
 const SILENCE_DURATION = 1400;
 const MAX_RECORDING_DURATION = 15000;
 const MIN_SPEECH_DURATION = 300;

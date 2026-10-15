@@ -1,11 +1,17 @@
+
 import { useState, useRef, useEffect } from "react";
 import { parseCommand } from "../utils/commandParser";
+import API_BASE_URL from "../config";
 import "./Chat.css";
 
 function Chat() {
   const [messages, setMessages] = useState([
-    { sender: "milo", text: "Hi! Main Milo hoon, Bhumi ne banaya hai mujhe. Hindi, Marathi, Gujarati aur English — sab mein baat kar sakta hoon. Kuch bhi pucho!" }
+    {
+      sender: "milo",
+      text: "Hi! Main Milo hoon, Bhumi ne banaya hai mujhe. Hindi, Marathi, Gujarati aur English — sab mein baat kar sakta hoon. Kuch bhi pucho!",
+    },
   ]);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
@@ -22,10 +28,15 @@ function Chat() {
 
   const sendMessage = async () => {
     const trimmed = input.trim();
+
     if (!trimmed || loading) return;
 
     const historyForRequest = buildHistory(messages);
-    const newMessages = [...messages, { sender: "user", text: trimmed }];
+    const newMessages = [
+      ...messages,
+      { sender: "user", text: trimmed },
+    ];
+
     setMessages(newMessages);
     setInput("");
     setLoading(true);
@@ -33,57 +44,119 @@ function Chat() {
     const command = parseCommand(trimmed);
 
     try {
-      let replyText;
+      let replyText = "";
 
       if (command.type === "add_contact") {
-        const res = await fetch("http://localhost:8000/add_contact", {
+        const res = await fetch(`${API_BASE_URL}/add_contact`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: command.payload.name, number: command.payload.number }),
+          body: JSON.stringify({
+            name: command.payload.name,
+            number: command.payload.number,
+          }),
         });
-        replyText = (await res.json()).message;
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "Contact request failed");
+        }
+
+        replyText = data.message || "Contact request completed.";
       } else if (command.type === "whatsapp") {
-        const res = await fetch("http://localhost:8000/whatsapp", {
+        const res = await fetch(`${API_BASE_URL}/whatsapp`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contact: command.payload.contact, message: command.payload.message }),
+          body: JSON.stringify({
+            contact: command.payload.contact,
+            message: command.payload.message,
+          }),
         });
-        replyText = (await res.json()).message;
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "WhatsApp request failed");
+        }
+
+        replyText = data.message || "WhatsApp request completed.";
       } else if (command.type === "youtube") {
-        const res = await fetch("http://localhost:8000/youtube", {
+        const res = await fetch(`${API_BASE_URL}/youtube`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ query: command.payload }),
         });
-        replyText = (await res.json()).message;
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "YouTube request failed");
+        }
+
+        replyText = data.message || "YouTube request completed.";
       } else if (command.type === "app") {
-        const res = await fetch("http://localhost:8000/action", {
+        const res = await fetch(`${API_BASE_URL}/action`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ app: command.payload }),
         });
-        replyText = (await res.json()).message;
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "Action request failed");
+        }
+
+        replyText = data.message || "Action request completed.";
       } else if (command.type === "weather") {
-        const res = await fetch("http://localhost:8000/weather", {
+        const res = await fetch(`${API_BASE_URL}/weather`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ city: command.payload }),
         });
-        replyText = (await res.json()).message;
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "Weather request failed");
+        }
+
+        replyText = data.message || "Weather request completed.";
       } else if (command.type === "info") {
         replyText = command.payload;
       } else {
-        const res = await fetch("http://localhost:8000/chat", {
+        const res = await fetch(`${API_BASE_URL}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: trimmed, history: historyForRequest }),
+          body: JSON.stringify({
+            message: trimmed,
+            history: historyForRequest,
+          }),
         });
-        replyText = (await res.json()).reply;
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail || data.message || "Chat request failed");
+        }
+
+        replyText = data.reply || "Mujhe abhi response nahi mila.";
       }
 
-      setMessages([...newMessages, { sender: "milo", text: replyText }]);
+      setMessages([
+        ...newMessages,
+        { sender: "milo", text: String(replyText) },
+      ]);
     } catch (err) {
-      setMessages([...newMessages, { sender: "milo", text: "Backend se connect nahi ho paya." }]);
+      console.error("MILO chat error:", err);
+
+      setMessages([
+        ...newMessages,
+        {
+          sender: "milo",
+          text: "Backend se connect nahi ho paya. Please backend status check karke dobara try karo.",
+        },
+      ]);
     } finally {
       setLoading(false);
     }
@@ -104,11 +177,15 @@ function Chat() {
             {msg.text}
           </div>
         ))}
+
         {loading && (
           <div className="chat-bubble milo typing">
-            <span></span><span></span><span></span>
+            <span></span>
+            <span></span>
+            <span></span>
           </div>
         )}
+
         <div ref={bottomRef} />
       </div>
 
@@ -120,7 +197,10 @@ function Chat() {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
         />
-        <button onClick={sendMessage} disabled={loading}>➤</button>
+
+        <button onClick={sendMessage} disabled={loading}>
+          ➤
+        </button>
       </div>
     </div>
   );
