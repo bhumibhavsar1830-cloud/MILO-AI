@@ -1,11 +1,10 @@
 import os
 import re
 import subprocess
+import tempfile
 from typing import Optional
 
 import requests
-import pywhatkit
-
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,28 +16,35 @@ load_dotenv()
 app = FastAPI(title="MILO AI Assistant")
 
 # =========================================================
-# CORS
-# =========================================================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =========================================================
 # ENVIRONMENT VARIABLES
 # =========================================================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+
+# Set FRONTEND_URL in Render after deploying the frontend.
+# Example: https://your-project.vercel.app
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if FRONTEND_URL and FRONTEND_URL not in allowed_origins:
+    allowed_origins.append(FRONTEND_URL)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
 
 # =========================================================
 # MODELS
@@ -73,22 +79,20 @@ class TTSRequest(BaseModel):
 
 
 # =========================================================
-# BASIC ROUTE
+# BASIC ROUTES
 # =========================================================
 
 @app.get("/")
 def root():
     return {
         "status": "online",
-        "message": "MILO AI Backend is running 🚀"
+        "message": "MILO AI Backend is running 🚀",
     }
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 
 # =========================================================
@@ -97,14 +101,10 @@ def health():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-
     if not client:
-        return {
-            "reply": "Groq API key is missing."
-        }
+        return {"reply": "Groq API key is missing."}
 
     try:
-
         system_prompt = """
 You are MILO, a smart AI voice assistant developed by Bhumi.
 
@@ -136,29 +136,18 @@ Important:
         response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": request.message
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.message},
             ],
             temperature=0.7,
             max_tokens=500,
         )
 
-        reply = response.choices[0].message.content.strip()
-
-        return {
-            "reply": reply
-        }
+        reply = (response.choices[0].message.content or "").strip()
+        return {"reply": reply or "Sorry, mujhe abhi response nahi mila."}
 
     except Exception as e:
-
-        print("❌ Chat error:", e)
-
+        print("Chat error:", repr(e))
         return {
             "reply": "Sorry, mujhe abhi response generate karne mein problem aa rahi hai."
         }
@@ -168,89 +157,50 @@ Important:
 # TRANSCRIPTION
 # =========================================================
 
-@app.post("/transcribe")
+@app.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe(file: UploadFile = File(...)):
-
-    temp_file = "temp_audio.webm"
+    temp_path = None
 
     try:
-
-        # Read uploaded audio file
         audio_data = await file.read()
-
-        print("📥 Received audio file:", file.filename)
-        print("📦 Audio size:", len(audio_data), "bytes")
+        print("Received audio file:", file.filename)
+        print("Audio size:", len(audio_data), "bytes")
 
         if not audio_data:
-            print("❌ Empty audio file")
+            return TranscribeResponse(text="", language="")
 
-            return {
-                "text": "",
-                "language": ""
-            }
-
-        # Save temporary audio file
-        with open(temp_file, "wb") as f:
-            f.write(audio_data)
-
-        print("💾 Temporary audio file saved")
-
-        # Check Groq client
         if not client:
-            print("❌ Groq client is missing")
+            print("Groq client is missing")
+            return TranscribeResponse(text="", language="")
 
-            return {
-                "text": "",
-                "language": ""
-            }
+        suffix = os.path.splitext(file.filename or "")[1] or ".webm"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(audio_data)
+            temp_path = temp_file.name
 
-        # Send audio to Groq Whisper
-        with open(temp_file, "rb") as audio_file:
-
+        with open(temp_path, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                file=("audio.webm", audio_file),
+                file=(file.filename or "audio.webm", audio_file),
                 model="whisper-large-v3-turbo",
                 response_format="verbose_json",
             )
 
-        # Get transcription
-        text = getattr(transcription, "text", "") or ""
+        text = (getattr(transcription, "text", "") or "").strip()
         language = getattr(transcription, "language", "") or ""
+        print("Transcribed language:", language)
 
-        text = text.strip()
-
-        print("🎤 Transcribed:", text)
-        print("🌐 Language:", language)
-
-        return {
-            "text": text,
-            "language": language
-        }
+        return TranscribeResponse(text=text, language=language)
 
     except Exception as e:
-
-        print("❌ Transcription error:", repr(e))
-
-        return {
-            "text": "",
-            "language": ""
-        }
+        print("Transcription error:", repr(e))
+        return TranscribeResponse(text="", language="")
 
     finally:
-
-        # Always delete temporary file
-        try:
-
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                print("🗑️ Temporary audio file removed")
-
-        except Exception as cleanup_error:
-
-            print(
-                "⚠️ Temporary file cleanup error:",
-                cleanup_error
-            )
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError as cleanup_error:
+                print("Temporary file cleanup error:", repr(cleanup_error))
 
 
 # =========================================================
@@ -258,50 +208,15 @@ async def transcribe(file: UploadFile = File(...)):
 # =========================================================
 
 APP_COMMANDS = {
-
-    "chrome": [
-        "chrome",
-        "google chrome"
-    ],
-
-    "notepad": [
-        "notepad"
-    ],
-
-    "calculator": [
-        "calculator",
-        "calc"
-    ],
-
-    "vscode": [
-        "vs code",
-        "visual studio code",
-        "vscode"
-    ],
-
-    "files": [
-        "file explorer",
-        "files",
-        "explorer"
-    ],
-
-    "instagram": [
-        "instagram"
-    ],
-
-    "youtube": [
-        "youtube",
-        "yt"
-    ],
-
-    "maps": [
-        "google maps",
-        "maps"
-    ],
-
-    "whatsapp": [
-        "whatsapp"
-    ],
+    "chrome": ["chrome", "google chrome"],
+    "notepad": ["notepad"],
+    "calculator": ["calculator", "calc"],
+    "vscode": ["vs code", "visual studio code", "vscode"],
+    "files": ["file explorer", "files", "explorer"],
+    "instagram": ["instagram"],
+    "youtube": ["youtube", "yt"],
+    "maps": ["google maps", "maps"],
+    "whatsapp": ["whatsapp"],
 }
 
 
@@ -311,126 +226,79 @@ APP_COMMANDS = {
 
 @app.post("/action")
 def action(request: ActionRequest):
-
     command = request.command.lower().strip()
 
-    try:
-
-        # Chrome
-        if command in ["chrome", "google chrome"]:
-
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", "chrome"],
-                shell=False
-            )
-
-            return {
-                "status": "success",
-                "message": "Opening Chrome."
-            }
-
-        # Notepad
-        if command == "notepad":
-
-            subprocess.Popen(
-                ["notepad.exe"]
-            )
-
-            return {
-                "status": "success",
-                "message": "Opening Notepad."
-            }
-
-        # Calculator
-        if command in ["calculator", "calc"]:
-
-            subprocess.Popen(
-                ["calc.exe"]
-            )
-
-            return {
-                "status": "success",
-                "message": "Opening Calculator."
-            }
-
-        # VS Code
-        if command in [
-            "vs code",
-            "visual studio code",
-            "vscode"
-        ]:
-
-            subprocess.Popen(
-                ["cmd", "/c", "code"],
-                shell=False
-            )
-
-            return {
-                "status": "success",
-                "message": "Opening VS Code."
-            }
-
-        # File Explorer
-        if command in [
-            "files",
-            "file explorer",
-            "explorer"
-        ]:
-
-            subprocess.Popen(
-                ["explorer.exe"]
-            )
-
-            return {
-                "status": "success",
-                "message": "Opening File Explorer."
-            }
-
-        # Websites
+    # This API is hosted on Render (Linux), not on the user's PC.
+    # It cannot launch desktop apps on the user's computer.
+    if os.name != "nt":
         website_urls = {
-
-            "instagram":
-                "https://www.instagram.com",
-
-            "youtube":
-                "https://www.youtube.com",
-
-            "maps":
-                "https://maps.google.com",
-
-            "google maps":
-                "https://maps.google.com",
-
-            "whatsapp":
-                "https://web.whatsapp.com",
+            "instagram": "https://www.instagram.com",
+            "youtube": "https://www.youtube.com",
+            "maps": "https://maps.google.com",
+            "google maps": "https://maps.google.com",
+            "whatsapp": "https://web.whatsapp.com",
         }
 
         if command in website_urls:
-
-            url = website_urls[command]
-
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", url],
-                shell=False
-            )
-
             return {
                 "status": "success",
-                "message": f"Opening {command}."
+                "message": f"Open this website in your browser: {website_urls[command]}",
+                "url": website_urls[command],
             }
 
         return {
             "status": "error",
-            "message": f"I don't know how to open {command}."
+            "message": (
+                "Desktop apps can only be opened by a local Windows agent. "
+                "This hosted backend cannot open apps on your computer."
+            ),
         }
 
-    except Exception as e:
+    try:
+        # Windows-only desktop actions, when running locally on Windows.
+        if command in ["chrome", "google chrome"]:
+            subprocess.Popen(["cmd", "/c", "start", "", "chrome"], shell=False)
+            return {"status": "success", "message": "Opening Chrome."}
 
-        print("❌ Action error:", e)
+        if command == "notepad":
+            subprocess.Popen(["notepad.exe"])
+            return {"status": "success", "message": "Opening Notepad."}
+
+        if command in ["calculator", "calc"]:
+            subprocess.Popen(["calc.exe"])
+            return {"status": "success", "message": "Opening Calculator."}
+
+        if command in ["vs code", "visual studio code", "vscode"]:
+            subprocess.Popen(["cmd", "/c", "code"], shell=False)
+            return {"status": "success", "message": "Opening VS Code."}
+
+        if command in ["files", "file explorer", "explorer"]:
+            subprocess.Popen(["explorer.exe"])
+            return {"status": "success", "message": "Opening File Explorer."}
+
+        website_urls = {
+            "instagram": "https://www.instagram.com",
+            "youtube": "https://www.youtube.com",
+            "maps": "https://maps.google.com",
+            "google maps": "https://maps.google.com",
+            "whatsapp": "https://web.whatsapp.com",
+        }
+
+        if command in website_urls:
+            url = website_urls[command]
+            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+            return {"status": "success", "message": f"Opening {command}."}
 
         return {
             "status": "error",
-            "message": "Unable to open the requested application."
+            "message": f"I don't know how to open {command}.",
+        }
+
+    except Exception as e:
+        print("Action error:", repr(e))
+        return {
+            "status": "error",
+            "message": "Unable to open the requested application.",
         }
 
 
@@ -440,27 +308,21 @@ def action(request: ActionRequest):
 
 @app.post("/youtube", response_model=YoutubeResponse)
 def play_youtube(request: YoutubeRequest):
+    if not YOUTUBE_API_KEY:
+        return YoutubeResponse(
+            status="error",
+            message="YouTube API key is missing.",
+        )
+
+    query = request.query.strip()
+    if not query:
+        return YoutubeResponse(
+            status="error",
+            message="Please tell me which song you want to play.",
+        )
 
     try:
-
-        if not YOUTUBE_API_KEY:
-
-            return YoutubeResponse(
-                status="error",
-                message="YouTube API key is missing."
-            )
-
-        query = request.query.strip()
-
-        if not query:
-
-            return YoutubeResponse(
-                status="error",
-                message="Please tell me which song you want to play."
-            )
-
-        print("🎵 YouTube search:", query)
-
+        print("YouTube search:", query)
         response = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
             params={
@@ -472,128 +334,79 @@ def play_youtube(request: YoutubeRequest):
             },
             timeout=15,
         )
-
         response.raise_for_status()
-
         data = response.json()
 
-        if "error" in data:
-
-            error_message = data["error"].get(
-                "message",
-                "YouTube API error"
-            )
-
-            print("❌ YouTube API:", error_message)
-
-            return YoutubeResponse(
-                status="error",
-                message=error_message
-            )
-
         items = data.get("items", [])
-
         if not items:
-
             return YoutubeResponse(
                 status="error",
-                message=f"'{query}' ke liye koi video nahi mila."
+                message=f"'{query}' ke liye koi video nahi mila.",
             )
 
         first_item = items[0]
-
-        video_id = (
-            first_item
-            .get("id", {})
-            .get("videoId", "")
-        )
-
-        title = (
-            first_item
-            .get("snippet", {})
-            .get("title", query)
-        )
+        video_id = first_item.get("id", {}).get("videoId", "")
+        title = first_item.get("snippet", {}).get("title", query)
 
         if not video_id:
-
             return YoutubeResponse(
                 status="error",
-                message="YouTube video nahi mila."
+                message="YouTube video nahi mila.",
             )
 
-        print("✅ Video ID:", video_id)
-        print("🎵 Title:", title)
-
+        print("YouTube video found:", title)
         return YoutubeResponse(
             status="success",
             message=f"Playing {query} 🎵",
             video_id=video_id,
-            title=title
+            title=title,
         )
 
     except requests.exceptions.RequestException as e:
-
-        print("❌ YouTube request error:", e)
-
+        print("YouTube request error:", repr(e))
         return YoutubeResponse(
             status="error",
-            message="YouTube se connect nahi ho paya."
+            message="YouTube se connect nahi ho paya. API key/quota check karo.",
         )
 
     except Exception as e:
-
-        print("❌ YouTube error:", e)
-
+        print("YouTube error:", repr(e))
         return YoutubeResponse(
             status="error",
-            message="YouTube command failed."
+            message="YouTube command failed.",
         )
 
 
 # =========================================================
-# OPTIONAL TTS ROUTE
+# TEXT-TO-SPEECH
 # =========================================================
 
 @app.post("/tts")
 def text_to_speech(request: TTSRequest):
+    text = request.text.strip()
+    if not text:
+        return {"status": "error", "message": "Text is empty."}
 
-    try:
-
-        text = request.text.strip()
-
-        if not text:
-
-            return {
-                "status": "error",
-                "message": "Text is empty."
-            }
-
-        return {
-            "status": "success",
-            "message": text
-        }
-
-    except Exception as e:
-
-        print("❌ TTS error:", e)
-
-        return {
-            "status": "error",
-            "message": "TTS failed."
-        }
+    # This endpoint is still a placeholder. Azure credentials are read above,
+    # but actual Azure audio generation has not been implemented here.
+    return {
+        "status": "success",
+        "message": text,
+        "tts_ready": bool(AZURE_SPEECH_KEY and AZURE_SPEECH_REGION),
+        "note": "This endpoint does not generate an audio file yet.",
+    }
 
 
 # =========================================================
-# RUN
+# RUN LOCALLY
 # =========================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
     )
