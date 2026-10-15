@@ -1,0 +1,108 @@
+.avatar-outer {
+  position: relative;
+  width: 300px;
+  height: 300px;
+  margin: 0 auto 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid rgba(80, 190, 255, 0.35);
+  box-shadow:
+    0 0 20px 2px rgba(80, 190, 255, 0.25),
+    inset 0 0 20px 2px rgba(80, 190, 255, 0.15);
+  animation: rotate-ring 6s linear infinite;
+}
+
+.avatar-ring::before,
+.avatar-ring::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4fd8ff;
+  box-shadow: 0 0 8px 2px #4fd8ff;
+}
+
+.avatar-ring::before {
+  top: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.avatar-ring::after {
+  bottom: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.avatar-wrap {
+  position: relative;
+  width: 260px;
+  height: 260px;
+  border-radius: 50%;
+  overflow: hidden;
+  box-shadow: 0 0 0 3px rgba(20, 30, 50, 0.6), 0 0 24px 4px rgba(80, 190, 255, 0.3);
+  animation: breathe 3.2s ease-in-out infinite;
+  z-index: 1;
+}
+
+.avatar-outer.speaking .avatar-wrap {
+  box-shadow: 0 0 0 3px rgba(20, 30, 50, 0.6), 0 0 44px 10px rgba(90, 200, 255, 0.6);
+  animation: none;
+  transform: scale(1.02);
+}
+
+.avatar-outer.speaking .avatar-ring {
+  border-color: rgba(90, 200, 255, 0.65);
+  animation: rotate-ring 2.2s linear infinite;
+}
+
+.avatar-img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  user-select: none;
+}
+
+.avatar-mouth-open {
+  transition: opacity 0.05s linear;
+}
+
+.avatar-bars {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: 20px;
+  margin-top: 0.5rem;
+}
+
+.avatar-bars .bar {
+  width: 3px;
+  border-radius: 2px;
+  background: #4fd8ff;
+  box-shadow: 0 0 6px 1px rgba(79, 216, 255, 0.6);
+  height: 4px;
+  transition: height 0.08s ease;
+}
+
+@keyframes rotate-ring {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.015); }
+}

@@ -1,0 +1,56 @@
+.voice-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  gap: 20px;
+}
+
+.mic-orb {
+  width: 130px;
+  height: 130px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #bdfeff, #00c3ff 55%, #0047c9 100%);
+  box-shadow: 0 0 20px rgba(0, 217, 255, 0.5), 0 0 50px rgba(0, 217, 255, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+
+.mic-orb:hover { transform: scale(1.05); }
+
+.mic-orb.listening {
+  animation: pulse 1.2s ease-in-out infinite;
+  box-shadow: 0 0 30px rgba(255, 70, 70, 0.6), 0 0 70px rgba(255, 70, 70, 0.35);
+  background: radial-gradient(circle at 35% 30%, #ffd0d0, #ff5c5c 55%, #b30000 100%);
+}
+
+.mic-icon { font-size: 44px; }
+
+.voice-status {
+  font-family: 'Inter', sans-serif;
+  font-size: 14px;
+  letter-spacing: 1px;
+  color: #7fdfff;
+  text-transform: uppercase;
+}
+
+.voice-result { max-width: 480px; text-align: center; margin-top: 8px; }
+
+.voice-label {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: #52708a;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.voice-text { font-family: 'Inter', sans-serif; font-size: 15px; color: #eaf6ff; line-height: 1.5; }
+.voice-text.milo { color: #7fdfff; }
+
+@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
