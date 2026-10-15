@@ -32,6 +32,7 @@ function Chat() {
     if (!trimmed || loading) return;
 
     const historyForRequest = buildHistory(messages);
+
     const newMessages = [
       ...messages,
       { sender: "user", text: trimmed },
@@ -41,9 +42,8 @@ function Chat() {
     setInput("");
     setLoading(true);
 
-    const command = parseCommand(trimmed);
-
     try {
+      const command = parseCommand(trimmed);
       let replyText = "";
 
       if (command.type === "add_contact") {
@@ -59,10 +59,13 @@ function Chat() {
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "Contact request failed");
+          throw new Error(
+            data.detail || data.message || "Contact request failed"
+          );
         }
 
         replyText = data.message || "Contact request completed.";
+
       } else if (command.type === "whatsapp") {
         const res = await fetch(`${API_BASE_URL}/whatsapp`, {
           method: "POST",
@@ -76,10 +79,13 @@ function Chat() {
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "WhatsApp request failed");
+          throw new Error(
+            data.detail || data.message || "WhatsApp request failed"
+          );
         }
 
         replyText = data.message || "WhatsApp request completed.";
+
       } else if (command.type === "youtube") {
         const res = await fetch(`${API_BASE_URL}/youtube`, {
           method: "POST",
@@ -90,24 +96,36 @@ function Chat() {
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "YouTube request failed");
+          throw new Error(
+            data.detail || data.message || "YouTube request failed"
+          );
         }
 
-        replyText = data.message || "YouTube request completed.";
+        replyText =
+          data.message ||
+          (data.results?.length
+            ? data.results
+                .map((video) => `${video.title}\n${video.url}`)
+                .join("\n\n")
+            : "YouTube search mein koi result nahi mila.");
+
       } else if (command.type === "app") {
         const res = await fetch(`${API_BASE_URL}/action`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ app: command.payload }),
+          body: JSON.stringify({ action: command.payload }),
         });
 
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "Action request failed");
+          throw new Error(
+            data.detail || data.message || "Action request failed"
+          );
         }
 
         replyText = data.message || "Action request completed.";
+
       } else if (command.type === "weather") {
         const res = await fetch(`${API_BASE_URL}/weather`, {
           method: "POST",
@@ -118,13 +136,18 @@ function Chat() {
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "Weather request failed");
+          throw new Error(
+            data.detail || data.message || "Weather request failed"
+          );
         }
 
         replyText = data.message || "Weather request completed.";
+
       } else if (command.type === "info") {
         replyText = command.payload;
+
       } else {
+        // Normal questions go to the Groq-powered backend.
         const res = await fetch(`${API_BASE_URL}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -137,16 +160,24 @@ function Chat() {
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.detail || data.message || "Chat request failed");
+          throw new Error(
+            data.detail || data.message || "Chat request failed"
+          );
         }
 
-        replyText = data.reply || "Mujhe abhi response nahi mila.";
+        // Support both response formats used by backends.
+        replyText =
+          data.response ||
+          data.reply ||
+          data.message ||
+          "Mujhe abhi response nahi mila.";
       }
 
       setMessages([
         ...newMessages,
         { sender: "milo", text: String(replyText) },
       ]);
+
     } catch (err) {
       console.error("MILO chat error:", err);
 
@@ -154,9 +185,10 @@ function Chat() {
         ...newMessages,
         {
           sender: "milo",
-          text: "Backend se connect nahi ho paya. Please backend status check karke dobara try karo.",
+          text: "MILO se response nahi mil paya. Please backend logs check karo aur dobara try karo.",
         },
       ]);
+
     } finally {
       setLoading(false);
     }
@@ -196,9 +228,10 @@ function Chat() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
+          disabled={loading}
         />
 
-        <button onClick={sendMessage} disabled={loading}>
+        <button onClick={sendMessage} disabled={loading || !input.trim()}>
           ➤
         </button>
       </div>
