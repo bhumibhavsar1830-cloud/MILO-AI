@@ -1,6 +1,7 @@
 import { useState, useRef } from "react";
 import { parseCommand } from "../utils/commandParser";
-
+  const API_BASE =
+  import.meta.env.VITE_API_URL || "http://localhost:8000";
 export function useVoiceAssistant() {
   const [recording, setRecording] = useState(false);
   const [status, setStatus] = useState('Tap the mic to talk');
