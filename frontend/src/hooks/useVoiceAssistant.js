@@ -15,92 +15,75 @@ export function useVoiceAssistant() {
   const [stopSignal, setStopSignal] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
-  const mediaRecorderRef = useRef(null);
-  const chunksRef = useRef([]);
-  const audioContextRef = useRef(null);
-  const historyRef = useRef([]);
-  const silenceFrameRef = useRef(null);
+  const recorderRef = useRef(null);
   const streamRef = useRef(null);
-
-  const sanitizeForSpeech = (text) =>
-    String(text || "")
-      .replace(/[*_#>]/g, "")
-      .replace(/\n+/g, " ")
-      .trim();
+  const chunksRef = useRef([]);
+  const timerRef = useRef(null);
+  const historyRef = useRef([]);
 
   const stopSpeaking = useCallback(() => {
-    setStopSignal((value) => value + 1);
+    setStopSignal((n) => n + 1);
   }, []);
 
-  const cleanupRecording = useCallback(async () => {
-    if (silenceFrameRef.current !== null) {
-      cancelAnimationFrame(silenceFrameRef.current);
-      silenceFrameRef.current = null;
+  const cleanup = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
     }
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
-
-    if (audioContextRef.current) {
-      try {
-        await audioContextRef.current.close();
-      } catch (error) {
-        console.warn("AudioContext cleanup warning:", error);
-      }
-      audioContextRef.current = null;
-    }
   }, []);
 
   const speak = useCallback(async (text) => {
-    const clean = sanitizeForSpeech(text);
-    if (!clean) return;
+    if (!text?.trim()) return;
 
-    const isGujarati = /[\u0A80-\u0AFF]/.test(clean);
-    const isDevanagari = /[\u0900-\u097F]/.test(clean);
-    const lang = isGujarati ? "gu" : isDevanagari ? "hi" : "en";
+    const lang = /[\u0A80-\u0AFF]/.test(text)
+      ? "gu"
+      : /[\u0900-\u097F]/.test(text)
+      ? "hi"
+      : "en";
 
     try {
       const response = await fetch(`${API_BASE}/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: clean, lang }),
+        body: JSON.stringify({ text, lang }),
       });
 
       if (!response.ok) {
-        throw new Error(`Speech request failed: ${response.status}`);
+        throw new Error(`Speech API error: ${response.status}`);
       }
 
-      const audioBlob = await response.blob();
-      const url = URL.createObjectURL(audioBlob);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
 
-      setAudioUrl((previousUrl) => {
-        if (previousUrl) URL.revokeObjectURL(previousUrl);
+      setAudioUrl((oldUrl) => {
+        if (oldUrl) URL.revokeObjectURL(oldUrl);
         return url;
       });
     } catch (error) {
-      console.error("TTS failed:", error);
+      console.error("MILO speech error:", error);
     }
   }, []);
 
   const stopRecording = useCallback(() => {
-    if (silenceFrameRef.current !== null) {
-      cancelAnimationFrame(silenceFrameRef.current);
-      silenceFrameRef.current = null;
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
     }
 
-    const recorder = mediaRecorderRef.current;
+    const recorder = recorderRef.current;
 
     if (recorder && recorder.state === "recording") {
       recorder.stop();
-    } else {
-      setRecording(false);
     }
   }, []);
 
   const startRecording = useCallback(async () => {
-    if (mediaRecorderRef.current?.state === "recording") return;
+    if (recorderRef.current?.state === "recording") return;
 
     try {
       stopSpeaking();
@@ -109,14 +92,8 @@ export function useVoiceAssistant() {
       setStatus("Requesting microphone...");
 
       if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Microphone is not supported by this browser.");
+        throw new Error("Open MILO using HTTPS and allow microphone access.");
       }
-
-      if (typeof MediaRecorder === "undefined") {
-        throw new Error("Audio recording is not supported by this browser.");
-      }
-
-      await cleanupRecording();
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -128,13 +105,13 @@ export function useVoiceAssistant() {
 
       streamRef.current = stream;
 
-      const supportedMimeTypes = [
+      const types = [
         "audio/webm;codecs=opus",
         "audio/webm",
         "audio/mp4",
       ];
 
-      const mimeType = supportedMimeTypes.find((type) =>
+      const mimeType = types.find((type) =>
         MediaRecorder.isTypeSupported(type)
       );
 
@@ -142,7 +119,7 @@ export function useVoiceAssistant() {
         ? new MediaRecorder(stream, { mimeType })
         : new MediaRecorder(stream);
 
-      mediaRecorderRef.current = recorder;
+      recorderRef.current = recorder;
       chunksRef.current = [];
 
       recorder.ondataavailable = (event) => {
@@ -152,164 +129,120 @@ export function useVoiceAssistant() {
       };
 
       recorder.onerror = (event) => {
-        console.error("MediaRecorder error:", event.error);
-        setStatus("Recording failed. Please try again.");
+        console.error("Recorder error:", event.error);
+        cleanup();
         setRecording(false);
+        setStatus("Recording failed. Please try again.");
       };
 
       recorder.onstop = async () => {
         setRecording(false);
-        await cleanupRecording();
+        cleanup();
 
-        const actualMimeType = recorder.mimeType || "audio/webm";
+        const blobType = recorder.mimeType || "audio/webm";
         const audioBlob = new Blob(chunksRef.current, {
-          type: actualMimeType,
+          type: blobType,
+        });
+
+        console.log("MILO recording:", {
+          mimeType: blobType,
+          size: audioBlob.size,
+          chunks: chunksRef.current.length,
         });
 
         if (!audioBlob.size) {
-          setStatus("Kuch sunayi nahi diya, dobara try karo");
+          setStatus("Audio record nahi hua. Dobara try karo.");
           return;
         }
 
-        const extension = actualMimeType.includes("mp4")
-          ? "mp4"
-          : actualMimeType.includes("ogg")
-          ? "ogg"
-          : actualMimeType.includes("wav")
-          ? "wav"
-          : "webm";
-
-        setStatus("Transcribing audio...");
-
+        const extension = blobType.includes("mp4") ? "mp4" : "webm";
         const formData = new FormData();
         formData.append("file", audioBlob, `voice.${extension}`);
 
         try {
+          setStatus("MILO is listening...");
+
           const transcribeResponse = await fetch(
             `${API_BASE}/transcribe`,
-            {
-              method: "POST",
-              body: formData,
-            }
+            { method: "POST", body: formData }
           );
 
           if (!transcribeResponse.ok) {
-            const errorText = await transcribeResponse.text();
-            console.error(
-              "Transcription request failed:",
-              transcribeResponse.status,
-              errorText
-            );
             throw new Error(
-              `Transcription failed: ${transcribeResponse.status}`
+              `Transcription API error: ${transcribeResponse.status} ${await transcribeResponse.text()}`
             );
           }
 
-          const transcriptionData = await transcribeResponse.json();
-          const spokenText = transcriptionData.transcript?.trim();
+          const data = await transcribeResponse.json();
+          const spokenText = data.transcript?.trim();
 
           if (!spokenText) {
-            setStatus("Kuch sunayi nahi diya, dobara try karo");
+            setStatus("Awaaz clear nahi thi. Thoda paas se bolo.");
             return;
           }
 
           setTranscript(spokenText);
-          setStatus("Processing your message...");
+          setStatus("MILO is thinking...");
 
           const command = parseCommand(spokenText);
           let finalReply = "";
 
+          const postJSON = async (endpoint, body) => {
+            const response = await fetch(`${API_BASE}/${endpoint}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+
+            if (!response.ok) {
+              throw new Error(`${endpoint} API error: ${response.status}`);
+            }
+
+            return response.json();
+          };
+
           if (command.type === "add_contact") {
-            const response = await fetch(`${API_BASE}/add_contact`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                name: command.payload.name,
-                number: command.payload.number,
-              }),
+            const result = await postJSON("add_contact", {
+              name: command.payload.name,
+              number: command.payload.number,
             });
-
-            if (!response.ok) {
-              throw new Error("Add contact request failed");
-            }
-
-            finalReply = (await response.json()).message;
+            finalReply = result.message;
           } else if (command.type === "whatsapp") {
-            const response = await fetch(`${API_BASE}/whatsapp`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contact: command.payload.contact,
-                message: command.payload.message,
-              }),
+            const result = await postJSON("whatsapp", {
+              contact: command.payload.contact,
+              message: command.payload.message,
             });
-
-            if (!response.ok) {
-              throw new Error("WhatsApp request failed");
-            }
-
-            finalReply = (await response.json()).message;
+            finalReply = result.message;
           } else if (command.type === "youtube") {
-            const response = await fetch(`${API_BASE}/youtube`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ query: command.payload }),
+            const result = await postJSON("youtube", {
+              query: command.payload,
             });
-
-            if (!response.ok) {
-              throw new Error("YouTube request failed");
-            }
-
-            finalReply = (await response.json()).message;
+            finalReply = result.message;
           } else if (command.type === "app") {
-            const response = await fetch(`${API_BASE}/action`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ app: command.payload }),
+            const result = await postJSON("action", {
+              app: command.payload,
             });
-
-            if (!response.ok) {
-              throw new Error("App action request failed");
-            }
-
-            finalReply = (await response.json()).message;
+            finalReply = result.message;
           } else if (command.type === "weather") {
-            const response = await fetch(`${API_BASE}/weather`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ city: command.payload }),
+            const result = await postJSON("weather", {
+              city: command.payload,
             });
-
-            if (!response.ok) {
-              throw new Error("Weather request failed");
-            }
-
-            finalReply = (await response.json()).message;
+            finalReply = result.message;
           } else if (command.type === "info") {
             finalReply = command.payload;
           } else {
-            const response = await fetch(`${API_BASE}/chat`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                message: spokenText,
-                history: historyRef.current.slice(-12),
-              }),
+            const result = await postJSON("chat", {
+              message: spokenText,
+              history: historyRef.current.slice(-12),
             });
 
-            if (!response.ok) {
-              throw new Error("Chat request failed");
-            }
-
-            const chatData = await response.json();
             finalReply =
-              chatData.reply || "Sorry, I couldn't generate an answer.";
+              result.reply || "Sorry, I couldn't generate an answer.";
 
             historyRef.current.push(
               { role: "user", content: spokenText },
               { role: "assistant", content: finalReply }
             );
-
             historyRef.current = historyRef.current.slice(-20);
           }
 
@@ -318,105 +251,30 @@ export function useVoiceAssistant() {
           setStatus("Tap the mic to talk");
           await speak(finalReply);
         } catch (error) {
-          console.error("MILO request failed:", error);
-          setStatus("Backend se connect nahi ho paya");
+          console.error("MILO request error:", error);
+          setStatus("Connection error. Please try again.");
         }
       };
 
-      recorder.start();
+      recorder.start(250);
       setRecording(true);
-      setStatus("Listening...");
+      setStatus("Listening... Speak now.");
 
-      const AudioContextClass =
-        window.AudioContext || window.webkitAudioContext;
-
-      if (!AudioContextClass) {
-        // Recording still works; user can stop it manually.
-        return;
-      }
-
-      const audioContext = new AudioContextClass();
-      audioContextRef.current = audioContext;
-
-      if (audioContext.state === "suspended") {
-        await audioContext.resume();
-      }
-
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      source.connect(analyser);
-
-      const bufferLength = analyser.fftSize;
-      const dataArray = new Uint8Array(bufferLength);
-      const recordingStartTime = Date.now();
-
-      let silenceStart = null;
-      let hasSpoken = false;
-
-      const SPEECH_RMS_THRESHOLD = 0.015;
-      const SILENCE_RMS_THRESHOLD = 0.008;
-      const SILENCE_DURATION = 1200;
-      const MAX_RECORDING_MS = 10000;
-      const WARMUP_MS = 500;
-
-      const getRMS = () => {
-        analyser.getByteTimeDomainData(dataArray);
-        let sumSquares = 0;
-
-        for (let i = 0; i < bufferLength; i++) {
-          const normalized = (dataArray[i] - 128) / 128;
-          sumSquares += normalized * normalized;
-        }
-
-        return Math.sqrt(sumSquares / bufferLength);
-      };
-
-      const checkSilence = () => {
-        if (
-          !mediaRecorderRef.current ||
-          mediaRecorderRef.current.state !== "recording"
-        ) {
-          silenceFrameRef.current = null;
-          return;
-        }
-
-        const elapsed = Date.now() - recordingStartTime;
-
-        if (elapsed >= MAX_RECORDING_MS) {
-          stopRecording();
-          return;
-        }
-
-        if (elapsed >= WARMUP_MS) {
-          const rms = getRMS();
-
-          if (rms > SPEECH_RMS_THRESHOLD) {
-            hasSpoken = true;
-            silenceStart = null;
-          } else if (hasSpoken && rms < SILENCE_RMS_THRESHOLD) {
-            if (silenceStart === null) {
-              silenceStart = Date.now();
-            } else if (Date.now() - silenceStart >= SILENCE_DURATION) {
-              stopRecording();
-              return;
-            }
-          }
-        }
-
-        silenceFrameRef.current = requestAnimationFrame(checkSilence);
-      };
-
-      silenceFrameRef.current = requestAnimationFrame(checkSilence);
+      // Allow enough time for phone microphones and speech.
+      timerRef.current = setTimeout(() => {
+        if (recorder.state === "recording") recorder.stop();
+      }, 10000);
     } catch (error) {
-      console.error("Microphone start failed:", error);
-      await cleanupRecording();
+      console.error("MILO microphone error:", error);
+      cleanup();
       setRecording(false);
       setStatus(
-        "Mic start nahi hua. Permission check karke dobara try karo."
+        error.name === "NotAllowedError"
+          ? "Microphone permission allow karo."
+          : "Mic start nahi hua. HTTPS aur mic permission check karo."
       );
     }
-  }, [cleanupRecording, speak, stopRecording, stopSpeaking]);
+  }, [cleanup, speak, stopSpeaking]);
 
   return {
     recording,
