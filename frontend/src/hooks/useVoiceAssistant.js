@@ -1,529 +1,202 @@
-
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState, useRef } from "react";
 import { parseCommand } from "../utils/commandParser";
 
-import API_BASE_URL from "../config";
-
-const BACKEND_URL = API_BASE_URL;
-const SILENCE_DURATION = 1400;
-const MAX_RECORDING_DURATION = 15000;
-const MIN_SPEECH_DURATION = 300;
-
-function sanitizeForSpeech(text) {
-  if (!text) return "";
-
-  return text
-    .replace(/https?:\/\/\S+/gi, "")
-    .replace(/www\.\S+/gi, "")
-    .replace(/[*_`#]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function useVoiceAssistant() {
+export function useVoiceAssistant() {
   const [recording, setRecording] = useState(false);
-  const [status, setStatus] = useState("Click the microphone and speak");
+  const [status, setStatus] = useState('Tap the mic to talk');
   const [transcript, setTranscript] = useState("");
   const [reply, setReply] = useState("");
-  const [audioUrl, setAudioUrl] = useState("");
+  const [audioUrl, setAudioUrl] = useState(null);
   const [stopSignal, setStopSignal] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [youtubeVideoId, setYoutubeVideoId] = useState("");
-  const [youtubeTitle, setYoutubeTitle] = useState("");
 
   const mediaRecorderRef = useRef(null);
-  const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
-  const monitorRef = useRef(null);
-  const silenceStartRef = useRef(null);
-  const speechStartRef = useRef(null);
-  const autoModeRef = useRef(false);
-  const busyRef = useRef(false);
-  const mountedRef = useRef(true);
-  const restartTimerRef = useRef(null);
-  const audioUrlRef = useRef("");
+  const historyRef = useRef([]);
 
-  const clearMonitor = useCallback(() => {
-    if (monitorRef.current) {
-      clearInterval(monitorRef.current);
-      monitorRef.current = null;
-    }
-  }, []);
+  const sanitizeForSpeech = (text) =>
+    text.replace(/\*\*/g, "").replace(/[*_#`>]/g, "").replace(/\n+/g, " ").trim();
 
-  const cleanupStream = useCallback(() => {
-    clearMonitor();
+  const stopSpeaking = () => {
+    setStopSignal((s) => s + 1);
+  };
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
-    }
-
-    analyserRef.current = null;
-  }, [clearMonitor]);
-
-  const scheduleListening = useCallback((delay = 600) => {
-    if (!autoModeRef.current || !mountedRef.current) return;
-
-    clearTimeout(restartTimerRef.current);
-
-    restartTimerRef.current = setTimeout(() => {
-      if (
-        autoModeRef.current &&
-        mountedRef.current &&
-        !busyRef.current
-      ) {
-        startRecordingRef.current?.();
-      }
-    }, delay);
-  }, []);
-
-  const startRecordingRef = useRef(null);
-
-  const stopCapture = useCallback((process = true) => {
-    clearMonitor();
-
-    const recorder = mediaRecorderRef.current;
-
-    if (!recorder || recorder.state === "inactive") {
-      cleanupStream();
-      setRecording(false);
-      return;
-    }
-
-    recorder.onstop = async () => {
-      cleanupStream();
-
-      if (!process || !mountedRef.current) {
-        chunksRef.current = [];
-        return;
-      }
-
-      const blob = new Blob(chunksRef.current, {
-        type: recorder.mimeType || "audio/webm",
+  const speak = async (text) => {
+    const clean = sanitizeForSpeech(text);
+    if (!clean) return;
+    const isGujarati = /[\u0A80-\u0AFF]/.test(clean);
+    const isDevanagari = /[\u0900-\u097F]/.test(clean);
+    const lang = isGujarati ? "gu" : isDevanagari ? "hi" : "en";
+    try {
+      const res = await fetch("http://localhost:8000/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: clean, lang }),
       });
+      const audioBlob = await res.blob();
+      const url = URL.createObjectURL(audioBlob);
+      setAudioUrl(url);
+    } catch (err) {
+      console.error("TTS failed", err);
+    }
+  };
 
-      chunksRef.current = [];
+  const startRecording = async () => {
+    stopSpeaking();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mediaRecorder = new MediaRecorder(stream);
+    chunksRef.current = [];
+    mediaRecorder.ondataavailable = (e) => chunksRef.current.push(e.data);
 
-      console.log("🎙️ Audio size:", blob.size);
-
-      if (blob.size === 0) {
-        setStatus("No audio captured. Please speak again.");
-        scheduleListening();
-        return;
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach((track) => track.stop());
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
       }
-
-      busyRef.current = true;
-      setIsProcessing(true);
+      const audioBlob = new Blob(chunksRef.current, { type: "audio/webm" });
       setStatus("Thinking...");
+      const formData = new FormData();
+      formData.append("file", audioBlob, "voice.webm");
 
       try {
-        await processAudioRef.current(blob);
-      } finally {
-        busyRef.current = false;
-
-        if (mountedRef.current) {
-          setIsProcessing(false);
-        }
-      }
-    };
-
-    try {
-      recorder.stop();
-    } catch (error) {
-      console.error("❌ Stop recording error:", error);
-      cleanupStream();
-      setRecording(false);
-    }
-  }, [cleanupStream, clearMonitor, scheduleListening]);
-
-  const processAudioRef = useRef(null);
-
-  const processAudio = useCallback(async (audioBlob) => {
-    try {
-      setStatus("Processing your voice...");
-
-      const formData = new FormData();
-      formData.append("file", audioBlob, "audio.webm");
-
-      const transcriptionResponse = await fetch(
-        `${BACKEND_URL}/transcribe`,
-        {
+        const transcribeRes = await fetch("http://localhost:8000/transcribe", {
           method: "POST",
           body: formData,
-        }
-      );
-
-      if (!transcriptionResponse.ok) {
-        const details = await transcriptionResponse.text();
-        throw new Error(
-          `Transcription failed (${transcriptionResponse.status}): ${details}`
-        );
-      }
-
-      const transcriptionData = await transcriptionResponse.json();
-      const text = transcriptionData.text?.trim() || "";
-
-      console.log("🎤 Transcript:", text);
-
-      if (!text) {
-        setStatus("I couldn't hear you clearly. Try again.");
-        scheduleListening();
-        return;
-      }
-
-      setTranscript(text);
-      setStatus("Thinking...");
-
-      const command = parseCommand(text);
-      console.log("🧠 Parsed command:", command);
-
-      let finalReply = "";
-
-      if (command.type === "youtube") {
-        setYoutubeVideoId("");
-        setYoutubeTitle("");
-
-        const response = await fetch(`${BACKEND_URL}/youtube`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: command.payload }),
         });
+        const { transcript: text } = await transcribeRes.json();
 
-        if (!response.ok) {
-          throw new Error(`YouTube request failed: ${response.status}`);
+        if (!text || !text.trim()) {
+          setStatus('Kuch sunayi nahi diya, dobara try karo');
+          return;
         }
 
-        const data = await response.json();
+        setTranscript(text);
+        const command = parseCommand(text);
+        let finalReply = "";
 
-        if (data.status === "success" && data.video_id) {
-          setYoutubeVideoId(data.video_id);
-          setYoutubeTitle(data.title || command.payload);
-          finalReply = `Playing ${data.title || command.payload}.`;
+        if (command.type === "add_contact") {
+          const res = await fetch("http://localhost:8000/add_contact", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: command.payload.name, number: command.payload.number }),
+          });
+          finalReply = (await res.json()).message;
+        } else if (command.type === "whatsapp") {
+          const res = await fetch("http://localhost:8000/whatsapp", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ contact: command.payload.contact, message: command.payload.message }),
+          });
+          finalReply = (await res.json()).message;
+        } else if (command.type === "youtube") {
+          const res = await fetch("http://localhost:8000/youtube", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: command.payload }),
+          });
+          finalReply = (await res.json()).message;
+        } else if (command.type === "app") {
+          const res = await fetch("http://localhost:8000/action", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ app: command.payload }),
+          });
+          finalReply = (await res.json()).message;
+        } else if (command.type === "weather") {
+          const res = await fetch("http://localhost:8000/weather", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ city: command.payload }),
+          });
+          finalReply = (await res.json()).message;
+        } else if (command.type === "info") {
+          finalReply = command.payload;
         } else {
-          finalReply = data.message || "I couldn't find that YouTube video.";
-        }
-      } else if (command.type === "app") {
-        const response = await fetch(`${BACKEND_URL}/action`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: command.payload }),
-        });
-
-        if (!response.ok) {
-          throw new Error(`Application request failed: ${response.status}`);
+          const res = await fetch("http://localhost:8000/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text, history: historyRef.current.slice(-12) }),
+          });
+          finalReply = (await res.json()).reply;
+          historyRef.current.push({ role: "user", content: text });
+          historyRef.current.push({ role: "assistant", content: finalReply });
         }
 
-        const data = await response.json();
-        finalReply = data.message || `Opening ${command.payload}.`;
-      } else if (command.type === "weather") {
-        finalReply = "The weather feature is not connected to a live weather service yet.";
-      } else if (command.type === "time") {
-        finalReply = `The time is ${new Date().toLocaleTimeString()}.`;
-      } else if (command.type === "date") {
-        finalReply = `Today is ${new Date().toLocaleDateString()}.`;
-      } else {
-        const response = await fetch(`${BACKEND_URL}/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: command.payload || text }),
-        });
-
-        if (!response.ok) {
-          throw new Error(`Chat request failed: ${response.status}`);
-        }
-
-        const data = await response.json();
-        finalReply = data.reply || "Sorry, I couldn't generate an answer.";
-      }
-
-      if (!mountedRef.current) return;
-
-      setReply(finalReply);
-      setStatus("Speaking...");
-
-      const speechText = sanitizeForSpeech(finalReply);
-
-      if (!speechText || !("speechSynthesis" in window)) {
-        setStatus("Ready");
-        scheduleListening();
-        return;
-      }
-
-      window.speechSynthesis.cancel();
-
-      const utterance = new SpeechSynthesisUtterance(speechText);
-      utterance.rate = 1;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-
-      utterance.onstart = () => {
-        if (!mountedRef.current) return;
-        setIsSpeaking(true);
-        setStatus("Speaking...");
-      };
-
-      utterance.onend = () => {
-        if (!mountedRef.current) return;
-        setIsSpeaking(false);
-        setStopSignal((value) => value + 1);
-        setStatus(autoModeRef.current ? "Ready — listening again soon" : "Ready");
-        scheduleListening(700);
-      };
-
-      utterance.onerror = (event) => {
-        if (!mountedRef.current) return;
-        console.error("❌ Speech synthesis error:", event.error);
-        setIsSpeaking(false);
-        setStatus("Ready");
-        scheduleListening();
-      };
-
-      window.speechSynthesis.speak(utterance);
-    } catch (error) {
-      console.error("❌ Voice assistant error:", error);
-
-      if (mountedRef.current) {
-        setStatus("Something went wrong. Check the backend terminal.");
-        setReply("Sorry, I couldn't process that. Please try again.");
-      }
-
-      scheduleListening(1500);
-    }
-  }, [scheduleListening]);
-
-  processAudioRef.current = processAudio;
-
-  const startRecording = useCallback(async () => {
-    if (busyRef.current || !mountedRef.current) return;
-
-    try {
-      clearTimeout(restartTimerRef.current);
-
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
-
-      setIsSpeaking(false);
-      setStatus("Listening... Speak now");
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
-
-      if (!autoModeRef.current || !mountedRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-
-      streamRef.current = stream;
-
-      const audioContext = new AudioContext();
-      audioContextRef.current = audioContext;
-
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      source.connect(analyser);
-      analyserRef.current = analyser;
-
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-
-      const recorder = new MediaRecorder(stream, { mimeType });
-      mediaRecorderRef.current = recorder;
-      chunksRef.current = [];
-      silenceStartRef.current = null;
-      speechStartRef.current = null;
-
-      recorder.ondataavailable = (event) => {
-        if (event.data?.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onstop = async () => {
-        cleanupStream();
-
-        const blob = new Blob(chunksRef.current, {
-          type: recorder.mimeType || "audio/webm",
-        });
-
-        chunksRef.current = [];
-        console.log("🎙️ Audio size:", blob.size);
-
-        if (!autoModeRef.current || !mountedRef.current) return;
-
-        if (blob.size === 0) {
-          setStatus("I couldn't hear you. Please speak again.");
-          scheduleListening();
-          return;
-        }
-
-        busyRef.current = true;
-        setIsProcessing(true);
-        setStatus("Thinking...");
-
-        try {
-          await processAudioRef.current(blob);
-        } finally {
-          busyRef.current = false;
-          if (mountedRef.current) setIsProcessing(false);
-        }
-      };
-
-      recorder.start(250);
-      setRecording(true);
-
-      console.log("🎤 Recording started");
-
-      const samples = new Uint8Array(analyser.fftSize);
-      const startedAt = Date.now();
-
-      monitorRef.current = setInterval(() => {
-        if (
-          !autoModeRef.current ||
-          !mountedRef.current ||
-          recorder.state !== "recording"
-        ) {
-          return;
-        }
-
-        analyser.getByteTimeDomainData(samples);
-
-        let sum = 0;
-
-        for (let i = 0; i < samples.length; i++) {
-          const normalized = (samples[i] - 128) / 128;
-          sum += normalized * normalized;
-        }
-
-        const rms = Math.sqrt(sum / samples.length);
-        const speakingNow = rms > 0.025;
-        const elapsed = Date.now() - startedAt;
-
-        if (speakingNow) {
-          if (!speechStartRef.current) {
-            speechStartRef.current = Date.now();
-            console.log("🗣️ Speech detected");
-          }
-
-          silenceStartRef.current = null;
-          setStatus("Listening...");
-        } else if (speechStartRef.current) {
-          if (!silenceStartRef.current) {
-            silenceStartRef.current = Date.now();
-          }
-
-          const silentFor = Date.now() - silenceStartRef.current;
-          const spokenFor = silenceStartRef.current - speechStartRef.current;
-
-          if (
-            silentFor >= SILENCE_DURATION &&
-            spokenFor >= MIN_SPEECH_DURATION
-          ) {
-            console.log("🤫 Silence detected — processing");
-            setRecording(false);
-            clearMonitor();
-            recorder.stop();
-          }
-        }
-
-        if (elapsed >= MAX_RECORDING_DURATION) {
-          console.log("⏱️ Maximum recording duration reached");
-          setRecording(false);
-          clearMonitor();
-          recorder.stop();
-        }
-      }, 100);
-    } catch (error) {
-      console.error("❌ Microphone error:", error);
-      cleanupStream();
-      setRecording(false);
-      autoModeRef.current = false;
-
-      setStatus(
-        error.name === "NotAllowedError"
-          ? "Microphone permission denied. Allow microphone access."
-          : "Could not access microphone. Check browser permissions."
-      );
-    }
-  }, [cleanupStream, clearMonitor, scheduleListening]);
-
-  startRecordingRef.current = startRecording;
-
-  const stopRecording = useCallback(() => {
-    autoModeRef.current = false;
-    clearTimeout(restartTimerRef.current);
-    clearMonitor();
-
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-
-    setIsSpeaking(false);
-    setIsProcessing(false);
-    busyRef.current = false;
-
-    const recorder = mediaRecorderRef.current;
-
-    if (recorder && recorder.state !== "inactive") {
-      recorder.onstop = () => {
-        cleanupStream();
-        chunksRef.current = [];
-      };
-      recorder.stop();
-    } else {
-      cleanupStream();
-    }
-
-    setRecording(false);
-    setStatus("Stopped — click the microphone to talk again");
-  }, [cleanupStream, clearMonitor]);
-
-  const toggleConversation = useCallback(() => {
-    if (autoModeRef.current) {
-      stopRecording();
-      return;
-    }
-
-    autoModeRef.current = true;
-    setTranscript("");
-    setReply("");
-    startRecording();
-  }, [startRecording, stopRecording]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-
-    return () => {
-      mountedRef.current = false;
-      autoModeRef.current = false;
-      clearTimeout(restartTimerRef.current);
-      cleanupStream();
-
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
-
-      if (audioUrlRef.current) {
-        URL.revokeObjectURL(audioUrlRef.current);
+        setReply(finalReply);
+        setStatus('Tap the mic to talk');
+        speak(finalReply);
+      } catch (err) {
+        setStatus("Backend se connect nahi ho paya");
       }
     };
-  }, [cleanupStream]);
+
+    mediaRecorder.start();
+    mediaRecorderRef.current = mediaRecorder;
+    setRecording(true);
+    setStatus("Listening...");
+
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioContext.state === "suspended") await audioContext.resume();
+    audioContextRef.current = audioContext;
+    const source = audioContext.createMediaStreamSource(stream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    const bufferLength = analyser.fftSize;
+    const dataArray = new Uint8Array(bufferLength);
+
+    const recordingStartTime = Date.now();
+    let silenceStart = null;
+    let hasSpoken = false;
+    const SPEECH_RMS_THRESHOLD = 0.035;
+    const SILENCE_RMS_THRESHOLD = 0.02;
+    const SILENCE_DURATION = 800;
+    const MAX_RECORDING_MS = 8000;
+    const WARMUP_MS = 300;
+
+    const getRMS = () => {
+      analyser.getByteTimeDomainData(dataArray);
+      let sumSquares = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const normalized = (dataArray[i] - 128) / 128;
+        sumSquares += normalized * normalized;
+      }
+      return Math.sqrt(sumSquares / bufferLength);
+    };
+
+    const checkSilence = () => {
+      if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== "recording") return;
+      const elapsed = Date.now() - recordingStartTime;
+      if (elapsed > MAX_RECORDING_MS) {
+        stopRecording();
+        return;
+      }
+      if (elapsed > WARMUP_MS) {
+        const rms = getRMS();
+        if (rms > SPEECH_RMS_THRESHOLD) {
+          hasSpoken = true;
+          silenceStart = null;
+        } else if (hasSpoken && rms < SILENCE_RMS_THRESHOLD) {
+          if (!silenceStart) silenceStart = Date.now();
+          else if (Date.now() - silenceStart > SILENCE_DURATION) {
+            stopRecording();
+            return;
+          }
+        }
+      }
+      requestAnimationFrame(checkSilence);
+    };
+    requestAnimationFrame(checkSilence);
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+    setRecording(false);
+  };
 
   return {
     recording,
@@ -533,14 +206,8 @@ function useVoiceAssistant() {
     audioUrl,
     stopSignal,
     isSpeaking,
-    isProcessing,
     setIsSpeaking,
-    startRecording: toggleConversation,
+    startRecording,
     stopRecording,
-    youtubeVideoId,
-    youtubeTitle,
   };
 }
-
-export default useVoiceAssistant;
-export { useVoiceAssistant };

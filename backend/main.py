@@ -1,478 +1,436 @@
-
-import os
-import tempfile
-from typing import Optional
-
-import requests
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import Response
+from pydantic import BaseModel
 from groq import Groq
+from typing import List, Optional
+import os
+import subprocess
+import requests
+import json
+import azure.cognitiveservices.speech as speechsdk
+import pywhatkit
+from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-# ==================================================
-# MILO AI - FastAPI Backend
-# ==================================================
-
-app = FastAPI(title="MILO AI Assistant")
-
-# ==================================================
-# CORS
-# ==================================================
-
-DEFAULT_FRONTEND_URL = "https://milo-ai-lilac.vercel.app"
-
-FRONTEND_URL = os.getenv(
-    "FRONTEND_URL", DEFAULT_FRONTEND_URL
-).strip().rstrip("/")
-
-allowed_origins = [
-    DEFAULT_FRONTEND_URL,
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
-if FRONTEND_URL and FRONTEND_URL not in allowed_origins:
-    allowed_origins.append(FRONTEND_URL)
+app = FastAPI(title="Milo AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://milo-ai-lilac.vercel.app",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==================================================
-# ENVIRONMENT VARIABLES
-# ==================================================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
-AZURE_SPEECH_REGION = os.getenv(
-    "AZURE_SPEECH_REGION", ""
-).strip()
-
-groq_client = (
-    Groq(api_key=GROQ_API_KEY)
-    if GROQ_API_KEY
-    else None
+SYSTEM_PROMPT = (
+    "You are Milo, an AI assistant developed by Bhumi. "
+    "You speak Hindi, Marathi, Gujarati, and English. "
+    "Introduce yourself briefly when asked who you are. "
+    "Match the language used by the user. "
+    "Keep responses natural, concise, conversational, and suitable for speech. "
+    "Avoid unnecessary markdown formatting."
 )
 
-# ==================================================
-# REQUEST MODELS
-# ==================================================
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+
+VOICE_MAP = {
+    "hi": "hi-IN-SwaraNeural",
+    "en": "en-IN-NeerjaNeural",
+    "gu": "gu-IN-DhwaniNeural",
+    "mr": "mr-IN-AarohiNeural",
+}
+
+APP_COMMANDS = {
+    "chrome": "chrome",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "vscode": "code",
+    "files": "explorer",
+    "instagram": "https://instagram.com",
+    "youtube": "https://youtube.com",
+    "maps": "https://maps.google.com",
+    "whatsapp": "https://web.whatsapp.com",
+}
+
+CONTACTS_FILE = os.path.join(os.path.dirname(__file__), "contacts.json")
+
+
+def load_contacts():
+    if not os.path.exists(CONTACTS_FILE):
+        return {}
+    try:
+        with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_contacts(contacts):
+    with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(contacts, f, indent=2, ensure_ascii=False)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict[str, str]] = Field(default_factory=list)
+    history: Optional[List[ChatMessage]] = []
+
+
+class ChatResponse(BaseModel):
+    reply: str
 
 
 class ActionRequest(BaseModel):
-    action: Optional[str] = None
-    app: Optional[str] = None
+    app: str
 
 
-class YouTubeRequest(BaseModel):
+class ActionResponse(BaseModel):
+    status: str
+    message: str
+
+
+class YoutubeRequest(BaseModel):
     query: str
 
 
-class TTSRequest(BaseModel):
+class YoutubeResponse(BaseModel):
+    status: str
+    message: str
+
+
+class SpeakRequest(BaseModel):
     text: str
+    lang: str = "hi"
 
 
 class WeatherRequest(BaseModel):
-    city: str
+    city: str = "Pune"
 
 
-class ContactRequest(BaseModel):
-    name: str
-    number: str
+class WeatherResponse(BaseModel):
+    status: str
+    message: str
 
 
-class WhatsAppRequest(BaseModel):
+class WhatsappRequest(BaseModel):
     contact: str
     message: str
 
 
-# ==================================================
-# ROOT / HEALTH
-# ==================================================
+class WhatsappResponse(BaseModel):
+    status: str
+    message: str
+
+
+class AddContactRequest(BaseModel):
+    name: str
+    number: str
+
+
+class AddContactResponse(BaseModel):
+    status: str
+    message: str
+
 
 @app.get("/")
-def home():
-    return {
-        "status": "online",
-        "message": "MILO AI Backend is running 🚀"
-    }
+def health_check():
+    return {"status": "Milo backend is running"}
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "service": "MILO AI Backend",
-        "groq_configured": groq_client is not None
-    }
+    return {"status": "ok", "groq_configured": client is not None}
 
 
-# ==================================================
-# CHAT - GROQ AI
-# ==================================================
-
-@app.post("/chat")
+@app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
-    if groq_client is None:
+    if client is None:
+        from fastapi import HTTPException
         raise HTTPException(
             status_code=503,
-            detail="Groq API key is not configured on the backend."
+            detail="GROQ_API_KEY is missing. Check backend/.env.",
         )
 
-    message = request.message.strip()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    if not message:
-        raise HTTPException(
-            status_code=400,
-            detail="Please enter a message."
-        )
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are MILO, a personal AI assistant created by "
-                "Bhumi Bhavsar. Your name is Milo. If asked your name, "
-                "introduce yourself as Milo. If asked who created you, "
-                "say Bhumi Bhavsar created you.\n\n"
-                "PERSONALITY:\n"
-                "- Be friendly, natural, helpful, and conversational.\n"
-                "- Answer the actual question instead of giving generic "
-                "greetings or fallback messages.\n"
-                "- Support Hindi, Hinglish, Marathi, Gujarati, and English.\n"
-                "- Respond in the language the user uses whenever possible.\n"
-                "- Explain difficult topics in simple language when useful.\n"
-                "- Use previous conversation messages for context.\n"
-                "- Never claim an action succeeded unless it really did.\n"
-                "- Be honest about your tools and capabilities."
-            )
-        }
-    ]
-
-    # Include only valid recent conversation messages.
-    for item in request.history[-10:]:
-        role = item.get("role")
-        content = item.get("content", "")
-
-        if (
-            role in ("user", "assistant")
-            and isinstance(content, str)
-            and content.strip()
-        ):
+    for item in (request.history or [])[-12:]:
+        if item.role in ("user", "assistant") and item.content.strip():
             messages.append({
-                "role": role,
-                "content": content[:6000]
+                "role": item.role,
+                "content": item.content,
             })
 
-    # The frontend history contains previous messages only.
-    messages.append({
-        "role": "user",
-        "content": message
-    })
+    messages.append({"role": "user", "content": request.message})
 
     try:
-        completion = groq_client.chat.completions.create(
+        completion = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=messages,
-            temperature=0.7,
-            max_tokens=1024
         )
-
         answer = completion.choices[0].message.content
 
-        if not answer or not answer.strip():
-            answer = (
-                "Mujhe abhi answer nahi mila. "
-                "Please ek baar phir try karo."
-            )
+        if not answer:
+            answer = "Sorry, I couldn't generate an answer."
 
-        return {"response": answer.strip()}
+        return ChatResponse(reply=answer.strip())
 
-    except Exception as error:
-        # Detailed error appears in Render logs, not in the UI.
-        print("Chat error:", repr(error))
-
+    except Exception as e:
+        print("Groq chat error:", repr(e))
+        from fastapi import HTTPException
         raise HTTPException(
             status_code=502,
-            detail="MILO could not generate a response. Check backend logs."
+            detail="MILO could not get a response from Groq. Check the backend terminal.",
         )
 
-
-# ==================================================
-# SPEECH TRANSCRIPTION - GROQ WHISPER
-# ==================================================
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
-    if groq_client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Groq API key is not configured."
-        )
-
-    temp_path = None
+async def transcribe_audio(file: UploadFile = File(...)):
+    if client is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Groq API key is missing.")
 
     try:
         audio_bytes = await file.read()
-
-        if not audio_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="No audio received."
-            )
-
-        suffix = os.path.splitext(
-            file.filename or "recording.webm"
-        )[1] or ".webm"
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix
-        ) as temp_file:
-            temp_file.write(audio_bytes)
-            temp_path = temp_file.name
-
-        with open(temp_path, "rb") as audio_file:
-            transcription = groq_client.audio.transcriptions.create(
-                file=(
-                    os.path.basename(temp_path),
-                    audio_file.read()
-                ),
-                model="whisper-large-v3-turbo",
-                response_format="text"
-            )
-
-        if isinstance(transcription, str):
-            text_result = transcription.strip()
-        else:
-            text_result = getattr(
-                transcription, "text", ""
-            ).strip()
-
-        return {"text": text_result}
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        print("Transcription error:", repr(error))
-        raise HTTPException(
-            status_code=502,
-            detail="Audio transcription failed. Check backend logs."
+        transcription = client.audio.transcriptions.create(
+            file=(file.filename or "audio.wav", audio_bytes),
+            model="whisper-large-v3-turbo",
         )
-
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        return {"transcript": transcription.text}
+    except Exception as e:
+        print("Transcription error:", repr(e))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail="Audio transcription failed.")
 
 
-# ==================================================
-# ACTIONS
-# ==================================================
+@app.post("/action", response_model=ActionResponse)
+def open_app(request: ActionRequest):
+    app_name = request.app.lower().strip()
+    target = APP_COMMANDS.get(app_name)
 
-@app.post("/action")
-def perform_action(request: ActionRequest):
-    action = (request.action or request.app or "").strip().lower()
-
-    if not action:
-        raise HTTPException(
-            status_code=400,
-            detail="No action provided."
+    if not target:
+        return ActionResponse(
+            status="error",
+            message=f"'{app_name}' abhi supported nahi hai",
         )
-
-    website_actions = {
-        "open youtube": "https://www.youtube.com",
-        "youtube": "https://www.youtube.com",
-        "open google": "https://www.google.com",
-        "google": "https://www.google.com",
-        "open github": "https://github.com",
-        "github": "https://github.com",
-        "open gmail": "https://mail.google.com",
-        "gmail": "https://mail.google.com",
-    }
-
-    if action in website_actions:
-        service_name = action.replace("open ", "").title()
-
-        return {
-            "success": True,
-            "type": "website",
-            "url": website_actions[action],
-            "message": f"Opening {service_name}."
-        }
-
-    return {
-        "success": False,
-        "message": (
-            "This action is not supported by the cloud backend. "
-            "Opening local desktop applications requires a local agent."
-        )
-    }
-
-
-# ==================================================
-# YOUTUBE SEARCH
-# ==================================================
-
-@app.post("/youtube")
-def youtube_search(request: YouTubeRequest):
-    query = request.query.strip()
-
-    if not query:
-        raise HTTPException(
-            status_code=400,
-            detail="Please enter a search query."
-        )
-
-    if not YOUTUBE_API_KEY:
-        return {
-            "results": [],
-            "search_url": (
-                "https://www.youtube.com/results?search_query="
-                + requests.utils.quote(query)
-            ),
-            "message": "YouTube API key is not configured."
-        }
 
     try:
-        response = requests.get(
+        if target.startswith("https://"):
+            import webbrowser
+            webbrowser.open(target)
+        else:
+            subprocess.Popen(target, shell=True)
+
+        return ActionResponse(status="success", message=f"{app_name} khol diya")
+    except Exception as e:
+        print("Action error:", repr(e))
+        return ActionResponse(status="error", message="App open nahi ho paya.")
+
+
+@app.post("/youtube", response_model=YoutubeResponse)
+def play_youtube(request: YoutubeRequest):
+    if not YOUTUBE_API_KEY:
+        return YoutubeResponse(
+            status="error",
+            message="YOUTUBE_API_KEY backend/.env mein configure nahi hai.",
+        )
+
+    try:
+        res = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
             params={
                 "part": "snippet",
-                "q": query,
+                "q": request.query,
                 "type": "video",
-                "maxResults": 5,
+                "maxResults": 1,
                 "key": YOUTUBE_API_KEY,
             },
-            timeout=15
+            timeout=15,
         )
+        res.raise_for_status()
+        data = res.json()
 
-        response.raise_for_status()
-        data = response.json()
-        results = []
-
-        for item in data.get("items", []):
-            video_id = item.get("id", {}).get("videoId")
-
-            if not video_id:
-                continue
-
-            snippet = item.get("snippet", {})
-            thumbnail = (
-                snippet.get("thumbnails", {})
-                .get("high", {})
-                .get("url", "")
+        if not data.get("items"):
+            return YoutubeResponse(
+                status="error",
+                message=f"'{request.query}' ke liye video nahi mila.",
             )
 
-            results.append({
-                "title": snippet.get("title", ""),
-                "description": snippet.get("description", ""),
-                "thumbnail": thumbnail,
-                "url": f"https://www.youtube.com/watch?v={video_id}"
-            })
+        video = data["items"][0]
+        video_id = video["id"]["videoId"]
+        title = video["snippet"]["title"]
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        return {
-            "results": results,
-            "message": (
-                "YouTube results found."
-                if results
-                else "No YouTube results found."
+        import webbrowser
+        webbrowser.open(video_url)
+
+        return YoutubeResponse(
+            status="success",
+            message=f"Playing: {title}",
+        )
+    except Exception as e:
+        print("YouTube error:", repr(e))
+        return YoutubeResponse(status="error", message="YouTube request failed.")
+
+
+@app.post("/speak")
+def speak(request: SpeakRequest):
+    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=503,
+            detail="Azure Speech credentials are missing.",
+        )
+
+    try:
+        speech_config = speechsdk.SpeechConfig(
+            subscription=AZURE_SPEECH_KEY,
+            region=AZURE_SPEECH_REGION,
+        )
+        speech_config.speech_synthesis_voice_name = VOICE_MAP.get(
+            request.lang, "en-IN-NeerjaNeural"
+        )
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3
+        )
+
+        synthesizer = speechsdk.SpeechSynthesizer(
+            speech_config=speech_config,
+            audio_config=None,
+        )
+        result = synthesizer.speak_text_async(request.text).get()
+
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            return Response(content=result.audio_data, media_type="audio/mpeg")
+
+        print("Azure speech error:", getattr(result, "reason", "unknown"))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail="Speech synthesis failed.")
+
+    except Exception as e:
+        print("Speech error:", repr(e))
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail="Speech synthesis failed.")
+
+
+@app.post("/weather", response_model=WeatherResponse)
+def get_weather(request: WeatherRequest):
+    try:
+        geo_res = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": request.city, "count": 1},
+            timeout=15,
+        )
+        geo_res.raise_for_status()
+        geo_data = geo_res.json()
+
+        if not geo_data.get("results"):
+            return WeatherResponse(
+                status="error",
+                message=f"'{request.city}' nahi mila.",
             )
-        }
 
-    except Exception as error:
-        print("YouTube search error:", repr(error))
-        raise HTTPException(
-            status_code=502,
-            detail="YouTube search failed. Check backend logs."
+        location = geo_data["results"][0]
+        lat, lon = location["latitude"], location["longitude"]
+        city_name = location["name"]
+
+        weather_res = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current_weather": True,
+            },
+            timeout=15,
+        )
+        weather_res.raise_for_status()
+        weather_data = weather_res.json().get("current_weather")
+
+        if not weather_data:
+            return WeatherResponse(status="error", message="Weather data unavailable.")
+
+        temp = weather_data["temperature"]
+        wind = weather_data["windspeed"]
+
+        return WeatherResponse(
+            status="success",
+            message=f"{city_name} mein abhi temperature {temp}°C hai aur wind speed {wind} km/h hai.",
+        )
+    except Exception as e:
+        print("Weather error:", repr(e))
+        return WeatherResponse(status="error", message="Weather request failed.")
+
+
+@app.post("/whatsapp", response_model=WhatsappResponse)
+def send_whatsapp(request: WhatsappRequest):
+    contacts = load_contacts()
+    contact_key = request.contact.lower().strip()
+    phone = contacts.get(contact_key)
+
+    if not phone:
+        for name, number in contacts.items():
+            if contact_key in name or name in contact_key:
+                phone = number
+                break
+
+    if not phone:
+        return WhatsappResponse(
+            status="error",
+            message=f"'{request.contact}' ka number save nahi hai. Pehle contact save karo.",
+        )
+
+    try:
+        pywhatkit.sendwhatmsg_instantly(
+            phone,
+            request.message,
+            wait_time=15,
+            tab_close=True,
+        )
+        return WhatsappResponse(
+            status="success",
+            message=f"{request.contact} ke liye WhatsApp message action start kiya.",
+        )
+    except Exception as e:
+        print("WhatsApp error:", repr(e))
+        return WhatsappResponse(
+            status="error",
+            message="WhatsApp message send nahi ho paya. WhatsApp Web login check karo.",
         )
 
 
-# ==================================================
-# WEATHER - NOT CONFIGURED
-# ==================================================
+@app.post("/add_contact", response_model=AddContactResponse)
+def add_contact(request: AddContactRequest):
+    contacts = load_contacts()
+    name_key = request.name.lower().strip()
+    number = request.number.strip().replace(" ", "").replace("-", "")
 
-@app.post("/weather")
-def weather(request: WeatherRequest):
-    # Add a weather provider/API here before enabling this feature.
-    return {
-        "success": False,
-        "message": (
-            "Weather service is not configured yet. "
-            "A weather API integration is required."
-        )
-    }
-
-
-# ==================================================
-# CONTACT / WHATSAPP - NOT CONFIGURED
-# ==================================================
-
-@app.post("/add_contact")
-def add_contact(request: ContactRequest):
-    # Cloud servers cannot directly add contacts to your phone.
-    return {
-        "success": False,
-        "message": (
-            "Adding contacts requires an authorized device-side integration."
-        )
-    }
-
-
-@app.post("/whatsapp")
-def whatsapp(request: WhatsAppRequest):
-    # This endpoint does not send WhatsApp messages.
-    # Use an authorized WhatsApp integration or a click-to-chat link.
-    return {
-        "success": False,
-        "message": (
-            "WhatsApp sending is not configured. "
-            "An authorized WhatsApp integration is required."
-        )
-    }
-
-
-# ==================================================
-# TEXT-TO-SPEECH - NOT IMPLEMENTED
-# ==================================================
-
-@app.post("/tts")
-def text_to_speech(request: TTSRequest):
-    if not request.text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="No text provided."
+    if not name_key or not number:
+        return AddContactResponse(
+            status="error",
+            message="Name aur number dono required hain.",
         )
 
-    # Azure credentials alone do not implement speech synthesis.
-    # Integrate Azure Speech SDK/API before returning audio.
-    raise HTTPException(
-        status_code=501,
-        detail="Text-to-speech is not implemented yet."
+    if not number.startswith("+"):
+        number = "+91" + number
+
+    contacts[name_key] = number
+    save_contacts(contacts)
+
+    return AddContactResponse(
+        status="success",
+        message=f"{request.name} ka number save kar diya.",
     )
-
-
-# ==================================================
-# RUN LOCALLY
-# ==================================================
-# Local:
-# uvicorn main:app --reload --host 127.0.0.1 --port 8000
-#
-# Render:
-# uvicorn main:app --host 0.0.0.0 --port $PORT
