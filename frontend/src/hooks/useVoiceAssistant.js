@@ -1,7 +1,10 @@
+
 import { useState, useRef } from "react";
 import { parseCommand } from "../utils/commandParser";
-  const API_BASE =
+
+const API_BASE =
   import.meta.env.VITE_API_URL || "http://localhost:8000";
+
 export function useVoiceAssistant() {
   const [recording, setRecording] = useState(false);
   const [status, setStatus] = useState('Tap the mic to talk');
@@ -17,7 +20,7 @@ export function useVoiceAssistant() {
   const historyRef = useRef([]);
 
   const sanitizeForSpeech = (text) =>
-    text.replace(/\*\*/g, "").replace(/[*_#`>]/g, "").replace(/\n+/g, " ").trim();
+    text.replace(/\/\*\*.*?\*\*\//g, "").replace(/[\*\_#\`>]/g, "").replace(/\n+/g, " ").trim();
 
   const stopSpeaking = () => {
     setStopSignal((s) => s + 1);
@@ -30,7 +33,7 @@ export function useVoiceAssistant() {
     const isDevanagari = /[\u0900-\u097F]/.test(clean);
     const lang = isGujarati ? "gu" : isDevanagari ? "hi" : "en";
     try {
-      const res = await fetch("http://localhost:8000/speak", {
+      const res = await fetch(`${API_BASE}/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: clean, lang }),
@@ -62,7 +65,7 @@ export function useVoiceAssistant() {
       formData.append("file", audioBlob, "voice.webm");
 
       try {
-        const transcribeRes = await fetch("http://localhost:8000/transcribe", {
+        const transcribeRes = await fetch(`${API_BASE}/transcribe`, {
           method: "POST",
           body: formData,
         });
@@ -78,35 +81,35 @@ export function useVoiceAssistant() {
         let finalReply = "";
 
         if (command.type === "add_contact") {
-          const res = await fetch("http://localhost:8000/add_contact", {
+          const res = await fetch(`${API_BASE}/add_contact`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name: command.payload.name, number: command.payload.number }),
           });
           finalReply = (await res.json()).message;
         } else if (command.type === "whatsapp") {
-          const res = await fetch("http://localhost:8000/whatsapp", {
+          const res = await fetch(`${API_BASE}/whatsapp`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ contact: command.payload.contact, message: command.payload.message }),
           });
           finalReply = (await res.json()).message;
         } else if (command.type === "youtube") {
-          const res = await fetch("http://localhost:8000/youtube", {
+          const res = await fetch(`${API_BASE}/youtube`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ query: command.payload }),
           });
           finalReply = (await res.json()).message;
         } else if (command.type === "app") {
-          const res = await fetch("http://localhost:8000/action", {
+          const res = await fetch(`${API_BASE}/action`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ app: command.payload }),
           });
           finalReply = (await res.json()).message;
         } else if (command.type === "weather") {
-          const res = await fetch("http://localhost:8000/weather", {
+          const res = await fetch(`${API_BASE}/weather`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ city: command.payload }),
@@ -115,7 +118,7 @@ export function useVoiceAssistant() {
         } else if (command.type === "info") {
           finalReply = command.payload;
         } else {
-          const res = await fetch("http://localhost:8000/chat", {
+          const res = await fetch(`${API_BASE}/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message: text, history: historyRef.current.slice(-12) }),
