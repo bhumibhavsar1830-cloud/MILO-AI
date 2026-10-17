@@ -1,4 +1,3 @@
-
 import { useState } from "react";
 import "./App.css";
 
@@ -15,8 +14,6 @@ function App() {
   const voiceAssistant = useVoiceAssistant();
 
   const handleWake = () => {
-    if (voiceAssistant.recording) return;
-
     setActivePage("Voice");
     voiceAssistant.startRecording();
   };
@@ -25,23 +22,16 @@ function App() {
     <div className="app">
       <WakeWordListener
         onWake={handleWake}
-        paused={voiceAssistant.recording}
+        paused={voiceAssistant.recording || voiceAssistant.isSpeaking}
       />
-
-      <Sidebar
-        activePage={activePage}
-        onNavigate={setActivePage}
-      />
+      <Sidebar activePage={activePage} onNavigate={setActivePage} />
 
       <main className="main">
         <Header />
-
         <section className="content">
           {activePage === "Home" && <Orb />}
           {activePage === "Chat" && <Chat />}
-          {activePage === "Voice" && (
-            <Voice voiceAssistant={voiceAssistant} />
-          )}
+          {activePage === "Voice" && <Voice voiceAssistant={voiceAssistant} />}
         </section>
       </main>
     </div>

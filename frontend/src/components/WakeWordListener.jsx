@@ -1,20 +1,31 @@
 import { useEffect, useRef } from "react";
 
-// If the browser's speech recognition keeps failing with "network" errors
-// in a row, stop retrying entirely instead of hammering it forever - a
-// bad network / blocked endpoint won't fix itself by retrying every 300ms.
-const MAX_CONSECUTIVE_ERRORS = 5;
+const isMobileDevice = () =>
+  typeof navigator !== "undefined" &&
+  (/android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+
+const WAKE_REGEX = /\b(milo|mylo|meelo|millo)\b/;
 
 function WakeWordListener({ onWake, paused }) {
   const recognitionRef = useRef(null);
-  const restartTimeoutRef = useRef(null);
-  const consecutiveErrorsRef = useRef(0);
-  const gaveUpRef = useRef(false);
+  const restartTimerRef = useRef(null);
+  const activeRef = useRef(false);
+  const lastWakeRef = useRef(0);
+  const onWakeRef = useRef(onWake);
+  const pausedRef = useRef(paused);
 
   useEffect(() => {
+    onWakeRef.current = onWake;
+    pausedRef.current = paused;
+  });
+
+  useEffect(() => {
+    if (isMobileDevice()) return;
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      console.warn("Wake word ke liye Chrome ya Edge browser chahiye");
+      console.warn("Wake word ke liye Chrome ya Edge chahiye");
       return;
     }
 
@@ -23,69 +34,74 @@ function WakeWordListener({ onWake, paused }) {
     recognition.interimResults = true;
     recognition.lang = "en-IN";
 
+    const safeStart = () => {
+      if (pausedRef.current || activeRef.current) return;
+      try {
+        recognition.start();
+        activeRef.current = true;
+      } catch {
+        /* already started */
+      }
+    };
+
     recognition.onresult = (event) => {
-      const lastResult = event.results[event.results.length - 1];
-      const text = lastResult[0].transcript.toLowerCase();
-      if (text.includes("milo")) {
-        onWake();
+      const last = event.results[event.results.length - 1];
+      const text = last[0].transcript.toLowerCase();
+      if (WAKE_REGEX.test(text) && Date.now() - lastWakeRef.current > 4000) {
+        lastWakeRef.current = Date.now();
+        onWakeRef.current && onWakeRef.current();
       }
     };
 
     recognition.onerror = (e) => {
       if (e.error !== "no-speech" && e.error !== "aborted") {
-        consecutiveErrorsRef.current += 1;
-        console.error(
-          `Wake word error: ${e.error} (consecutive: ${consecutiveErrorsRef.current})`
-        );
-
-        if (consecutiveErrorsRef.current >= MAX_CONSECUTIVE_ERRORS && !gaveUpRef.current) {
-          gaveUpRef.current = true;
-          console.warn(
-            "Wake word listening disabled after repeated errors - mic button se manually bol sakti hai."
-          );
-        }
-      } else {
-        // A clean no-speech/aborted event means recognition is healthy again.
-        consecutiveErrorsRef.current = 0;
+        console.error("Wake word error:", e.error);
       }
     };
 
     recognition.onend = () => {
-      if (paused || gaveUpRef.current) return;
-
-      // Exponential-ish backoff: longer wait the more it keeps failing,
-      // so a broken network doesn't spin in a tight 300ms loop.
-      const delay = Math.min(300 * 2 ** consecutiveErrorsRef.current, 15000);
-      restartTimeoutRef.current = setTimeout(() => {
-        try {
-          recognition.start();
-        } catch (err) {
-          // ignore - already started / not allowed yet
-        }
-      }, delay);
+      activeRef.current = false;
+      if (!pausedRef.current) {
+        restartTimerRef.current = setTimeout(safeStart, 400);
+      }
     };
 
     recognitionRef.current = recognition;
-    try {
-      recognition.start();
-    } catch (err) {}
+    safeStart();
 
     return () => {
-      clearTimeout(restartTimeoutRef.current);
+      clearTimeout(restartTimerRef.current);
       recognition.onend = null;
-      recognition.stop();
+      try {
+        recognition.stop();
+      } catch {
+        /* ignore */
+      }
     };
   }, []);
 
   useEffect(() => {
     const recognition = recognitionRef.current;
     if (!recognition) return;
+
     if (paused) {
-      recognition.stop();
-    } else if (!gaveUpRef.current) {
       try {
-        recognition.start();
-      } catch (err) {}
+        recognition.stop();
+      } catch {
+        /* ignore */
+      }
+    } else {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = setTimeout(() => {
+        if (!pausedRef.current && !activeRef.current) {
+          try {
+            recognition.start();
+            activeRef.current = true;
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 600);
     }
   }, [paused]);
 

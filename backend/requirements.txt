@@ -3,5 +3,4 @@ uvicorn[standard]
 python-dotenv
 groq
 python-multipart
-azure-cognitiveservices-speech
-pywhatkit
+requests

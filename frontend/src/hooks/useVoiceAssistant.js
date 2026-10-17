@@ -1,290 +1,428 @@
-
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { parseCommand } from "../utils/commandParser";
+import { postForm, postForBlob, runCommand, openExternal, warmUp } from "../services/api";
 
-const API_BASE = (
-  import.meta.env.VITE_API_URL || "http://localhost:8000"
-).replace(/\/+$/, "");
+const IDLE_STATUS = "Tap the mic to talk";
+const SILENT_WAV =
+  "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==";
+
+const IS_IOS =
+  typeof navigator !== "undefined" &&
+  (/iphone|ipad|ipod/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+
+const SPEECH_RMS = 0.035;
+const SILENCE_RMS = 0.02;
+const SILENCE_MS = 900;
+const NO_SPEECH_TIMEOUT_MS = 6000;
+const MAX_RECORDING_MS = 12000;
+const WARMUP_MS = 300;
+
+const sanitizeForSpeech = (text) =>
+  text.replace(/\*\*/g, "").replace(/[*_#`>]/g, "").replace(/\n+/g, " ").trim();
+
+const detectLang = (text) => {
+  if (/[\u0A80-\u0AFF]/.test(text)) return "gu";
+  if (/[\u0900-\u097F]/.test(text)) return "hi";
+  return "en";
+};
+
+const pickMimeType = () => {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+};
+
+const extFromMime = (mime) => {
+  if (mime.includes("mp4")) return "mp4";
+  if (mime.includes("ogg")) return "ogg";
+  return "webm";
+};
 
 export function useVoiceAssistant() {
   const [recording, setRecording] = useState(false);
-  const [status, setStatus] = useState("Tap the mic to talk");
+  const [status, setStatus] = useState(IDLE_STATUS);
   const [transcript, setTranscript] = useState("");
   const [reply, setReply] = useState("");
-  const [audioUrl, setAudioUrl] = useState(null);
-  const [stopSignal, setStopSignal] = useState(0);
+  const [actionUrl, setActionUrl] = useState(null);
+  const [mouthLevel, setMouthLevel] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
-  const recorderRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const audioElRef = useRef(null);
+  const analyserRef = useRef(null);
+  const unlockedRef = useRef(false);
+  const lastUrlRef = useRef(null);
+
+  const mouthRafRef = useRef(null);
+  const lastLevelRef = useRef(0);
+
+  const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
+  const micSourceRef = useRef(null);
+  const vadTimerRef = useRef(null);
   const chunksRef = useRef([]);
-  const timerRef = useRef(null);
+  const discardRef = useRef(false);
+  const recordingRef = useRef(false);
+  const busyRef = useRef(false);
   const historyRef = useRef([]);
 
-  const stopSpeaking = useCallback(() => {
-    setStopSignal((n) => n + 1);
-  }, []);
-
-  const cleanup = useCallback(() => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
+  // ---------- Audio basics ----------
+  const getAudioContext = () => {
+    if (!audioCtxRef.current) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      audioCtxRef.current = new Ctx();
     }
+    return audioCtxRef.current;
+  };
 
+  const getAudioElement = () => {
+    if (!audioElRef.current) {
+      const el = new Audio();
+      el.preload = "auto";
+      audioElRef.current = el;
+    }
+    return audioElRef.current;
+  };
+
+  // Phone pe audio tabhi bajta hai jab user ke tap ke andar unlock ho
+  const unlockAudio = () => {
+    try {
+      const ctx = getAudioContext();
+      if (ctx.state === "suspended") ctx.resume();
+      if (!unlockedRef.current) {
+        const el = getAudioElement();
+        el.src = SILENT_WAV;
+        const p = el.play();
+        if (p && p.catch) p.catch(() => {});
+        unlockedRef.current = true;
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const ensurePlaybackAnalyser = () => {
+    if (analyserRef.current) return analyserRef.current;
+    const ctx = getAudioContext();
+    const el = getAudioElement();
+    const source = ctx.createMediaElementSource(el);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    analyser.connect(ctx.destination);
+    analyserRef.current = analyser;
+    return analyser;
+  };
+
+  // ---------- Mouth animation ----------
+  const pushMouthLevel = (v) => {
+    if (v === 0 || Math.abs(v - lastLevelRef.current) > 0.03) {
+      lastLevelRef.current = v;
+      setMouthLevel(v);
+    }
+  };
+
+  const stopMouthLoop = () => {
+    if (mouthRafRef.current) cancelAnimationFrame(mouthRafRef.current);
+    mouthRafRef.current = null;
+    pushMouthLevel(0);
+  };
+
+  const startMouthLoop = () => {
+    if (mouthRafRef.current) cancelAnimationFrame(mouthRafRef.current);
+    const analyser = !IS_IOS ? analyserRef.current : null;
+
+    if (analyser) {
+      const buf = new Uint8Array(analyser.fftSize);
+      let smooth = 0;
+      const tick = () => {
+        analyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = (buf[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / buf.length);
+        smooth = smooth * 0.65 + Math.min(1, rms * 6) * 0.35;
+        pushMouthLevel(smooth);
+        mouthRafRef.current = requestAnimationFrame(tick);
+      };
+      tick();
+    } else {
+      // iPhone pe WebAudio silent-switch se mute ho jata hai, isliye simulated mooh
+      const start = performance.now();
+      const tick = (now) => {
+        const t = (now - start) / 1000;
+        const v = 0.35 + 0.3 * Math.sin(t * 9) + 0.2 * Math.sin(t * 5.3 + 1) + 0.15 * Math.sin(t * 13.7);
+        pushMouthLevel(Math.max(0, Math.min(1, v)));
+        mouthRafRef.current = requestAnimationFrame(tick);
+      };
+      mouthRafRef.current = requestAnimationFrame(tick);
+    }
+  };
+
+  // ---------- Speaking ----------
+  const stopSpeaking = () => {
+    const el = audioElRef.current;
+    if (el) {
+      el.pause();
+      try {
+        el.currentTime = 0;
+      } catch {
+        /* ignore */
+      }
+    }
+    stopMouthLoop();
+    setIsSpeaking(false);
+  };
+
+  const speak = async (text) => {
+    const clean = sanitizeForSpeech(text);
+    if (!clean) return;
+
+    try {
+      const blob = await postForBlob("/speak", { text: clean, lang: detectLang(clean) });
+      const url = URL.createObjectURL(blob);
+      const el = getAudioElement();
+
+      if (!IS_IOS) {
+        try {
+          ensurePlaybackAnalyser();
+        } catch {
+          /* analyser na bane to bhi audio chalega */
+        }
+      }
+
+      if (lastUrlRef.current) URL.revokeObjectURL(lastUrlRef.current);
+      lastUrlRef.current = url;
+
+      el.onplay = () => {
+        setIsSpeaking(true);
+        startMouthLoop();
+      };
+      const finish = () => {
+        setIsSpeaking(false);
+        stopMouthLoop();
+      };
+      el.onended = finish;
+      el.onerror = finish;
+
+      el.src = url;
+      await el.play();
+    } catch (err) {
+      console.error("TTS failed", err);
+      setIsSpeaking(false);
+      stopMouthLoop();
+      if (err && err.name === "NotAllowedError") {
+        setStatus("Browser ne awaaz block ki, mic ko ek baar tap karo");
+      }
+    }
+  };
+
+  // ---------- Recording ----------
+  const releaseMic = () => {
+    if (vadTimerRef.current) clearInterval(vadTimerRef.current);
+    vadTimerRef.current = null;
+    if (micSourceRef.current) {
+      try {
+        micSourceRef.current.disconnect();
+      } catch {
+        /* ignore */
+      }
+      micSourceRef.current = null;
+    }
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
-  }, []);
+  };
 
-  const speak = useCallback(async (text) => {
-    if (!text?.trim()) return;
-
-    const lang = /[\u0A80-\u0AFF]/.test(text)
-      ? "gu"
-      : /[\u0900-\u097F]/.test(text)
-      ? "hi"
-      : "en";
-
+  const processAudio = async (blob, mime) => {
+    busyRef.current = true;
+    setStatus("Thinking...");
     try {
-      const response = await fetch(`${API_BASE}/speak`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, lang }),
-      });
+      const form = new FormData();
+      form.append("file", blob, `voice.${extFromMime(mime)}`);
+      const { transcript: text } = await postForm("/transcribe", form);
 
-      if (!response.ok) {
-        throw new Error(`Speech API error: ${response.status}`);
+      if (!text || !text.trim()) {
+        setStatus("Kuch sunayi nahi diya, dobara try karo");
+        return;
       }
 
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-
-      setAudioUrl((oldUrl) => {
-        if (oldUrl) URL.revokeObjectURL(oldUrl);
-        return url;
-      });
-    } catch (error) {
-      console.error("MILO speech error:", error);
-    }
-  }, []);
-
-  const stopRecording = useCallback(() => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-
-    const recorder = recorderRef.current;
-
-    if (recorder && recorder.state === "recording") {
-      recorder.stop();
-    }
-  }, []);
-
-  const startRecording = useCallback(async () => {
-    if (recorderRef.current?.state === "recording") return;
-
-    try {
-      stopSpeaking();
-      setTranscript("");
-      setReply("");
-      setStatus("Requesting microphone...");
-
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Open MILO using HTTPS and allow microphone access.");
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-
-      streamRef.current = stream;
-
-      const types = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/mp4",
-      ];
-
-      const mimeType = types.find((type) =>
-        MediaRecorder.isTypeSupported(type)
+      setTranscript(text);
+      const command = parseCommand(text);
+      const { reply: finalReply, url, isChat } = await runCommand(
+        command,
+        text,
+        historyRef.current.slice(-12)
       );
 
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
+      if (isChat) {
+        historyRef.current.push({ role: "user", content: text });
+        historyRef.current.push({ role: "assistant", content: finalReply });
+      }
 
-      recorderRef.current = recorder;
-      chunksRef.current = [];
+      setReply(finalReply);
+      setActionUrl(url || null);
+      if (url) openExternal(url);
 
-      recorder.ondataavailable = (event) => {
-        if (event.data?.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
+      setStatus(IDLE_STATUS);
+      speak(finalReply);
+    } catch (err) {
+      console.error(err);
+      setStatus(
+        err && err.name === "AbortError"
+          ? "Server slow hai, thodi der baad try karo"
+          : "Backend se connect nahi ho paya"
+      );
+    } finally {
+      busyRef.current = false;
+    }
+  };
 
-      recorder.onerror = (event) => {
-        console.error("Recorder error:", event.error);
-        cleanup();
-        setRecording(false);
-        setStatus("Recording failed. Please try again.");
-      };
+  const stopRecording = (opts = {}) => {
+    discardRef.current = !!(opts && opts.discard);
+    const rec = mediaRecorderRef.current;
+    if (rec && rec.state === "recording") rec.stop();
+    recordingRef.current = false;
+    setRecording(false);
+  };
 
-      recorder.onstop = async () => {
-        setRecording(false);
-        cleanup();
+  const startRecording = async () => {
+    if (recordingRef.current || busyRef.current) return;
 
-        const blobType = recorder.mimeType || "audio/webm";
-        const audioBlob = new Blob(chunksRef.current, {
-          type: blobType,
-        });
+    unlockAudio(); // tap ke andar hi, await se pehle
+    stopSpeaking();
 
-        console.log("MILO recording:", {
-          mimeType: blobType,
-          size: audioBlob.size,
-          chunks: chunksRef.current.length,
-        });
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setStatus("Is browser mein mic support nahi hai (HTTPS + Chrome/Safari chahiye)");
+      return;
+    }
 
-        if (!audioBlob.size) {
-          setStatus("Audio record nahi hua. Dobara try karo.");
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (err) {
+      setStatus(
+        err && err.name === "NotAllowedError"
+          ? "Mic permission band hai, browser settings mein allow karo"
+          : "Mic start nahi ho paya"
+      );
+      return;
+    }
+
+    streamRef.current = stream;
+    discardRef.current = false;
+    chunksRef.current = [];
+
+    const mimeType = pickMimeType();
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const actualMime = (recorder.mimeType || mimeType || "audio/webm").split(";")[0];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+    };
+
+    recorder.onstop = () => {
+      releaseMic();
+      if (discardRef.current) {
+        setStatus("Kuch sunayi nahi diya, dobara tap karo");
+        return;
+      }
+      const blob = new Blob(chunksRef.current, { type: actualMime });
+      if (blob.size < 1500) {
+        setStatus("Kuch sunayi nahi diya, dobara tap karo");
+        return;
+      }
+      processAudio(blob, actualMime);
+    };
+
+    recorder.start();
+    mediaRecorderRef.current = recorder;
+    recordingRef.current = true;
+    setRecording(true);
+    setStatus("Listening...");
+
+    // Chup hote hi auto-stop
+    try {
+      const ctx = getAudioContext();
+      if (ctx.state === "suspended") await ctx.resume();
+      const source = ctx.createMediaStreamSource(stream);
+      micSourceRef.current = source;
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+
+      const startTime = Date.now();
+      let silenceStart = null;
+      let hasSpoken = false;
+
+      vadTimerRef.current = setInterval(() => {
+        const rec = mediaRecorderRef.current;
+        if (!rec || rec.state !== "recording") return;
+
+        const elapsed = Date.now() - startTime;
+        if (elapsed > MAX_RECORDING_MS) {
+          stopRecording({ discard: !hasSpoken });
           return;
         }
-
-        const extension = blobType.includes("mp4") ? "mp4" : "webm";
-        const formData = new FormData();
-        formData.append("file", audioBlob, `voice.${extension}`);
-
-        try {
-          setStatus("MILO is listening...");
-
-          const transcribeResponse = await fetch(
-            `${API_BASE}/transcribe`,
-            { method: "POST", body: formData }
-          );
-
-          if (!transcribeResponse.ok) {
-            throw new Error(
-              `Transcription API error: ${transcribeResponse.status} ${await transcribeResponse.text()}`
-            );
-          }
-
-          const data = await transcribeResponse.json();
-          const spokenText = data.transcript?.trim();
-
-          if (!spokenText) {
-            setStatus("Awaaz clear nahi thi. Thoda paas se bolo.");
-            return;
-          }
-
-          setTranscript(spokenText);
-          setStatus("MILO is thinking...");
-
-          const command = parseCommand(spokenText);
-          let finalReply = "";
-
-          const postJSON = async (endpoint, body) => {
-            const response = await fetch(`${API_BASE}/${endpoint}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body),
-            });
-
-            if (!response.ok) {
-              throw new Error(`${endpoint} API error: ${response.status}`);
-            }
-
-            return response.json();
-          };
-
-          if (command.type === "add_contact") {
-            const result = await postJSON("add_contact", {
-              name: command.payload.name,
-              number: command.payload.number,
-            });
-            finalReply = result.message;
-          } else if (command.type === "whatsapp") {
-            const result = await postJSON("whatsapp", {
-              contact: command.payload.contact,
-              message: command.payload.message,
-            });
-            finalReply = result.message;
-          } else if (command.type === "youtube") {
-            const result = await postJSON("youtube", {
-              query: command.payload,
-            });
-            finalReply = result.message;
-          } else if (command.type === "app") {
-            const result = await postJSON("action", {
-              app: command.payload,
-            });
-            finalReply = result.message;
-          } else if (command.type === "weather") {
-            const result = await postJSON("weather", {
-              city: command.payload,
-            });
-            finalReply = result.message;
-          } else if (command.type === "info") {
-            finalReply = command.payload;
-          } else {
-            const result = await postJSON("chat", {
-              message: spokenText,
-              history: historyRef.current.slice(-12),
-            });
-
-            finalReply =
-              result.reply || "Sorry, I couldn't generate an answer.";
-
-            historyRef.current.push(
-              { role: "user", content: spokenText },
-              { role: "assistant", content: finalReply }
-            );
-            historyRef.current = historyRef.current.slice(-20);
-          }
-
-          finalReply = String(finalReply || "Request completed.");
-          setReply(finalReply);
-          setStatus("Tap the mic to talk");
-          await speak(finalReply);
-        } catch (error) {
-          console.error("MILO request error:", error);
-          setStatus("Connection error. Please try again.");
+        if (!hasSpoken && elapsed > NO_SPEECH_TIMEOUT_MS) {
+          stopRecording({ discard: true });
+          return;
         }
-      };
+        if (elapsed < WARMUP_MS) return;
 
-      recorder.start(250);
-      setRecording(true);
-      setStatus("Listening... Speak now.");
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = (data[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / data.length);
 
-      // Allow enough time for phone microphones and speech.
-      timerRef.current = setTimeout(() => {
-        if (recorder.state === "recording") recorder.stop();
-      }, 10000);
-    } catch (error) {
-      console.error("MILO microphone error:", error);
-      cleanup();
-      setRecording(false);
-      setStatus(
-        error.name === "NotAllowedError"
-          ? "Microphone permission allow karo."
-          : "Mic start nahi hua. HTTPS aur mic permission check karo."
-      );
+        if (rms > SPEECH_RMS) {
+          hasSpoken = true;
+          silenceStart = null;
+        } else if (hasSpoken && rms < SILENCE_RMS) {
+          if (!silenceStart) silenceStart = Date.now();
+          else if (Date.now() - silenceStart > SILENCE_MS) stopRecording();
+        }
+      }, 60);
+    } catch (err) {
+      console.warn("Auto-stop detection start nahi hua, manual tap se roko", err);
     }
-  }, [cleanup, speak, stopSpeaking]);
+  };
+
+  // ---------- Lifecycle ----------
+  useEffect(() => {
+    warmUp();
+
+    const unlock = () => unlockAudio();
+    const events = ["pointerdown", "touchstart", "keydown"];
+    events.forEach((e) => window.addEventListener(e, unlock, { once: true, passive: true }));
+
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, unlock));
+      releaseMic();
+      if (mouthRafRef.current) cancelAnimationFrame(mouthRafRef.current);
+      if (audioElRef.current) audioElRef.current.pause();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     recording,
     status,
     transcript,
     reply,
-    audioUrl,
-    stopSignal,
+    actionUrl,
+    mouthLevel,
     isSpeaking,
-    setIsSpeaking,
     startRecording,
     stopRecording,
   };

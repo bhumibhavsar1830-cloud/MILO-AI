@@ -1,43 +1,49 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from groq import Groq
 from typing import List, Optional
+from xml.sax.saxutils import escape
 import os
 import subprocess
 import requests
-import json
-import azure.cognitiveservices.speech as speechsdk
-import pywhatkit
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
 app = FastAPI(title="Milo AI Backend")
 
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if FRONTEND_URL:
+    allowed_origins.append(FRONTEND_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://milo-ai-lilac.vercel.app",
-    ],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 SYSTEM_PROMPT = (
     "You are Milo, an AI assistant developed by Bhumi. "
-    "You speak Hindi, Marathi, Gujarati, and English. "
-    "Introduce yourself briefly when asked who you are. "
-    "Match the language used by the user. "
-    "Keep responses natural, concise, conversational, and suitable for speech. "
-    "Avoid unnecessary markdown formatting."
+    "You are multilingual and can speak Hindi, Marathi, Gujarati, and English. "
+    "If someone asks who you are or introduces themselves to you for the first time, "
+    "briefly introduce yourself as Milo, built by Bhumi, and mention you can speak "
+    "Hindi, Marathi, Gujarati and English. Don't repeat this introduction in every reply. "
+    "Always reply in plain, natural sentences without any markdown formatting "
+    "(no asterisks, no bullet points, no numbered lists, no headers). "
+    "Match your reply language to the user's input: if they wrote in English, reply in English. "
+    "If they wrote in Hindi (Devanagari script) or Hinglish, reply in Hindi. "
+    "If they wrote in Gujarati, reply in Gujarati. "
+    "Never mix multiple languages within a single reply unless the user did so first. "
+    "If the input language is unclear, default to English. "
+    "Keep responses concise and conversational, suitable for being spoken aloud."
 )
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
@@ -48,37 +54,26 @@ VOICE_MAP = {
     "hi": "hi-IN-SwaraNeural",
     "en": "en-IN-NeerjaNeural",
     "gu": "gu-IN-DhwaniNeural",
-    "mr": "mr-IN-AarohiNeural",
 }
 
-APP_COMMANDS = {
-    "chrome": "chrome",
-    "notepad": "notepad",
-    "calculator": "calc",
-    "vscode": "code",
-    "files": "explorer",
+# Ye web apps user ke apne device pe khulte hain (frontend link kholta hai)
+WEB_APPS = {
     "instagram": "https://instagram.com",
     "youtube": "https://youtube.com",
     "maps": "https://maps.google.com",
     "whatsapp": "https://web.whatsapp.com",
 }
 
-CONTACTS_FILE = os.path.join(os.path.dirname(__file__), "contacts.json")
+# Ye sirf tab chalte hain jab backend tumhare Windows laptop pe local chal raha ho
+LOCAL_APPS = {
+    "chrome": "chrome",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "vscode": "code",
+    "files": "explorer",
+}
 
-
-def load_contacts():
-    if not os.path.exists(CONTACTS_FILE):
-        return {}
-    try:
-        with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_contacts(contacts):
-    with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(contacts, f, indent=2, ensure_ascii=False)
+IS_WINDOWS = os.name == "nt"
 
 
 class ChatMessage(BaseModel):
@@ -102,6 +97,7 @@ class ActionRequest(BaseModel):
 class ActionResponse(BaseModel):
     status: str
     message: str
+    url: Optional[str] = None
 
 
 class YoutubeRequest(BaseModel):
@@ -111,6 +107,7 @@ class YoutubeRequest(BaseModel):
 class YoutubeResponse(BaseModel):
     status: str
     message: str
+    url: Optional[str] = None
 
 
 class SpeakRequest(BaseModel):
@@ -127,128 +124,66 @@ class WeatherResponse(BaseModel):
     message: str
 
 
-class WhatsappRequest(BaseModel):
-    contact: str
-    message: str
-
-
-class WhatsappResponse(BaseModel):
-    status: str
-    message: str
-
-
-class AddContactRequest(BaseModel):
-    name: str
-    number: str
-
-
-class AddContactResponse(BaseModel):
-    status: str
-    message: str
-
-
 @app.get("/")
 def health_check():
     return {"status": "Milo backend is running"}
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "groq_configured": client is not None}
-
-
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
-    if client is None:
-        from fastapi import HTTPException
-        raise HTTPException(
-            status_code=503,
-            detail="GROQ_API_KEY is missing. Check backend/.env.",
-        )
-
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    for item in (request.history or [])[-12:]:
-        if item.role in ("user", "assistant") and item.content.strip():
-            messages.append({
-                "role": item.role,
-                "content": item.content,
-            })
-
+    for h in request.history:
+        messages.append({"role": h.role, "content": h.content})
     messages.append({"role": "user", "content": request.message})
 
-    try:
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=messages,
-        )
-        answer = completion.choices[0].message.content
-
-        if not answer:
-            answer = "Sorry, I couldn't generate an answer."
-
-        return ChatResponse(reply=answer.strip())
-
-    except Exception as e:
-        print("Groq chat error:", repr(e))
-        from fastapi import HTTPException
-        raise HTTPException(
-            status_code=502,
-            detail="MILO could not get a response from Groq. Check the backend terminal.",
-        )
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+    )
+    return ChatResponse(reply=completion.choices[0].message.content)
 
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
-    if client is None:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=503, detail="Groq API key is missing.")
-
-    try:
-        audio_bytes = await file.read()
-        transcription = client.audio.transcriptions.create(
-            file=(file.filename or "audio.wav", audio_bytes),
-            model="whisper-large-v3-turbo",
-        )
-        return {"transcript": transcription.text}
-    except Exception as e:
-        print("Transcription error:", repr(e))
-        from fastapi import HTTPException
-        raise HTTPException(status_code=502, detail="Audio transcription failed.")
+    audio_bytes = await file.read()
+    transcription = client.audio.transcriptions.create(
+        file=(file.filename or "voice.webm", audio_bytes),
+        model="whisper-large-v3-turbo",
+        temperature=0,
+    )
+    return {"transcript": transcription.text}
 
 
 @app.post("/action", response_model=ActionResponse)
 def open_app(request: ActionRequest):
     app_name = request.app.lower().strip()
-    target = APP_COMMANDS.get(app_name)
 
-    if not target:
+    if app_name in WEB_APPS:
         return ActionResponse(
-            status="error",
-            message=f"'{app_name}' abhi supported nahi hai",
+            status="success",
+            message=f"{app_name} khol raha hoon ✅",
+            url=WEB_APPS[app_name],
         )
 
-    try:
-        if target.startswith("https://"):
-            import webbrowser
-            webbrowser.open(target)
-        else:
-            subprocess.Popen(target, shell=True)
+    if app_name in LOCAL_APPS:
+        if IS_WINDOWS:
+            try:
+                subprocess.Popen(f"start {LOCAL_APPS[app_name]}", shell=True)
+                return ActionResponse(status="success", message=f"{app_name} khol diya ✅")
+            except Exception as e:
+                return ActionResponse(status="error", message=str(e))
+        return ActionResponse(
+            status="error",
+            message=f"{app_name} sirf laptop pe local Milo backend ke saath khulta hai, cloud version se nahi.",
+        )
 
-        return ActionResponse(status="success", message=f"{app_name} khol diya")
-    except Exception as e:
-        print("Action error:", repr(e))
-        return ActionResponse(status="error", message="App open nahi ho paya.")
+    return ActionResponse(status="error", message=f"'{app_name}' abhi supported nahi hai")
 
 
 @app.post("/youtube", response_model=YoutubeResponse)
 def play_youtube(request: YoutubeRequest):
     if not YOUTUBE_API_KEY:
-        return YoutubeResponse(
-            status="error",
-            message="YOUTUBE_API_KEY backend/.env mein configure nahi hai.",
-        )
-
+        return YoutubeResponse(status="error", message="YouTube API key set nahi hai")
     try:
         res = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
@@ -261,70 +196,49 @@ def play_youtube(request: YoutubeRequest):
             },
             timeout=15,
         )
-        res.raise_for_status()
         data = res.json()
 
         if not data.get("items"):
-            return YoutubeResponse(
-                status="error",
-                message=f"'{request.query}' ke liye video nahi mila.",
-            )
+            return YoutubeResponse(status="error", message=f"'{request.query}' ke liye kuch nahi mila")
 
-        video = data["items"][0]
-        video_id = video["id"]["videoId"]
-        title = video["snippet"]["title"]
+        video_id = data["items"][0]["id"]["videoId"]
+        title = data["items"][0]["snippet"]["title"]
         video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        import webbrowser
-        webbrowser.open(video_url)
-
-        return YoutubeResponse(
-            status="success",
-            message=f"Playing: {title}",
-        )
+        return YoutubeResponse(status="success", message=f"Playing: {title} 🎵", url=video_url)
     except Exception as e:
-        print("YouTube error:", repr(e))
-        return YoutubeResponse(status="error", message="YouTube request failed.")
+        return YoutubeResponse(status="error", message=str(e))
 
 
 @app.post("/speak")
 def speak(request: SpeakRequest):
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-        from fastapi import HTTPException
-        raise HTTPException(
-            status_code=503,
-            detail="Azure Speech credentials are missing.",
-        )
+        raise HTTPException(status_code=500, detail="Azure Speech keys set nahi hain")
 
-    try:
-        speech_config = speechsdk.SpeechConfig(
-            subscription=AZURE_SPEECH_KEY,
-            region=AZURE_SPEECH_REGION,
-        )
-        speech_config.speech_synthesis_voice_name = VOICE_MAP.get(
-            request.lang, "en-IN-NeerjaNeural"
-        )
-        speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3
-        )
+    voice = VOICE_MAP.get(request.lang, VOICE_MAP["hi"])
+    lang_tag = voice[:5]
+    ssml = (
+        f"<speak version='1.0' xml:lang='{lang_tag}'>"
+        f"<voice name='{voice}'>{escape(request.text)}</voice>"
+        f"</speak>"
+    )
 
-        synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=speech_config,
-            audio_config=None,
-        )
-        result = synthesizer.speak_text_async(request.text).get()
+    res = requests.post(
+        f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
+        headers={
+            "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-16khz-32kbitrate-mono-mp3",
+            "User-Agent": "milo-ai",
+        },
+        data=ssml.encode("utf-8"),
+        timeout=30,
+    )
 
-        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-            return Response(content=result.audio_data, media_type="audio/mpeg")
+    if res.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Azure TTS error {res.status_code}")
 
-        print("Azure speech error:", getattr(result, "reason", "unknown"))
-        from fastapi import HTTPException
-        raise HTTPException(status_code=502, detail="Speech synthesis failed.")
-
-    except Exception as e:
-        print("Speech error:", repr(e))
-        from fastapi import HTTPException
-        raise HTTPException(status_code=502, detail="Speech synthesis failed.")
+    return Response(content=res.content, media_type="audio/mpeg")
 
 
 @app.post("/weather", response_model=WeatherResponse)
@@ -335,14 +249,10 @@ def get_weather(request: WeatherRequest):
             params={"name": request.city, "count": 1},
             timeout=15,
         )
-        geo_res.raise_for_status()
         geo_data = geo_res.json()
 
         if not geo_data.get("results"):
-            return WeatherResponse(
-                status="error",
-                message=f"'{request.city}' nahi mila.",
-            )
+            return WeatherResponse(status="error", message=f"'{request.city}' nahi mila")
 
         location = geo_data["results"][0]
         lat, lon = location["latitude"], location["longitude"]
@@ -350,87 +260,16 @@ def get_weather(request: WeatherRequest):
 
         weather_res = requests.get(
             "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current_weather": True,
-            },
+            params={"latitude": lat, "longitude": lon, "current_weather": True},
             timeout=15,
         )
-        weather_res.raise_for_status()
-        weather_data = weather_res.json().get("current_weather")
-
-        if not weather_data:
-            return WeatherResponse(status="error", message="Weather data unavailable.")
-
+        weather_data = weather_res.json()["current_weather"]
         temp = weather_data["temperature"]
         wind = weather_data["windspeed"]
 
         return WeatherResponse(
             status="success",
-            message=f"{city_name} mein abhi temperature {temp}°C hai aur wind speed {wind} km/h hai.",
+            message=f"{city_name} mein abhi temperature {temp}°C hai aur wind speed {wind} km/h hai",
         )
     except Exception as e:
-        print("Weather error:", repr(e))
-        return WeatherResponse(status="error", message="Weather request failed.")
-
-
-@app.post("/whatsapp", response_model=WhatsappResponse)
-def send_whatsapp(request: WhatsappRequest):
-    contacts = load_contacts()
-    contact_key = request.contact.lower().strip()
-    phone = contacts.get(contact_key)
-
-    if not phone:
-        for name, number in contacts.items():
-            if contact_key in name or name in contact_key:
-                phone = number
-                break
-
-    if not phone:
-        return WhatsappResponse(
-            status="error",
-            message=f"'{request.contact}' ka number save nahi hai. Pehle contact save karo.",
-        )
-
-    try:
-        pywhatkit.sendwhatmsg_instantly(
-            phone,
-            request.message,
-            wait_time=15,
-            tab_close=True,
-        )
-        return WhatsappResponse(
-            status="success",
-            message=f"{request.contact} ke liye WhatsApp message action start kiya.",
-        )
-    except Exception as e:
-        print("WhatsApp error:", repr(e))
-        return WhatsappResponse(
-            status="error",
-            message="WhatsApp message send nahi ho paya. WhatsApp Web login check karo.",
-        )
-
-
-@app.post("/add_contact", response_model=AddContactResponse)
-def add_contact(request: AddContactRequest):
-    contacts = load_contacts()
-    name_key = request.name.lower().strip()
-    number = request.number.strip().replace(" ", "").replace("-", "")
-
-    if not name_key or not number:
-        return AddContactResponse(
-            status="error",
-            message="Name aur number dono required hain.",
-        )
-
-    if not number.startswith("+"):
-        number = "+91" + number
-
-    contacts[name_key] = number
-    save_contacts(contacts)
-
-    return AddContactResponse(
-        status="success",
-        message=f"{request.name} ka number save kar diya.",
-    )
+        return WeatherResponse(status="error", message=str(e))
